@@ -1,9 +1,8 @@
 /// <reference path="./kino.d.ts" />
 /**
- * FlixLatam plugin for Kino — v1.0.0
+ * FlixLatam plugin for Kino — v1.1.0
  * Series, películas y anime en latino (flixlatam.com)
- * Home: Últimos episodios, Películas, Series, Anime, Populares
- * Audio + servidores manuales vía alternatives
+ * Resolve: PoW + AES (Embed69) → Streamwish/Voe/Vidhide → m3u8
  */
 
 const BASE = "https://flixlatam.com";
@@ -35,6 +34,19 @@ async function get(path, referer) {
     });
   }
   return await r.text();
+}
+
+async function getSoft(url, referer) {
+  try {
+    var r = await kino.fetch(url, {
+      headers: hdr(referer ? { Referer: referer } : null),
+      timeoutMs: 18000,
+    });
+    if (!r.ok) return "";
+    return await r.text();
+  } catch (e) {
+    return "";
+  }
 }
 
 function strip(s) {
@@ -125,7 +137,6 @@ function pathFromUrl(u) {
   return u;
 }
 
-/** Parse catalog / search cards: article.item */
 function parseItems(html) {
   var items = [];
   var seen = {};
@@ -135,24 +146,18 @@ function parseItems(html) {
   while ((m = re.exec(html)) !== null) {
     var href = abs(m[2]);
     if (!/flixlatam\.com\/(serie|anime|pelicula)\//i.test(href)) continue;
-    // skip episode deep links in catalog
     if (/\/temporada\/|\/capitulo\//i.test(href)) {
-      // map episode card to series root
-      var root = href.replace(/\/temporada\/.*$/i, "");
-      href = root;
+      href = href.replace(/\/temporada\/.*$/i, "");
     }
     var path = pathFromUrl(href);
     if (seen[path]) continue;
     seen[path] = true;
-
     var title = strip(m[5] || m[4] || "");
     if (!title) {
       var slug = path.split("/").pop() || "";
       title = slug.replace(/-[a-zA-Z0-9]{5,}$/, "").replace(/-/g, " ");
     }
-    // clean "Ver X online"
     title = title.replace(/^Ver\s+/i, "").replace(/\s+online$/i, "").trim();
-
     var poster = abs(m[3]);
     var kind = kindFromUrl(href);
     items.push({
@@ -165,8 +170,6 @@ function parseItems(html) {
       genres: kind === "movie" ? ["movies"] : /\/anime\//i.test(href) ? ["anime"] : ["series"],
     });
   }
-
-  // Fallback simpler pattern
   if (items.length === 0) {
     var re2 =
       /href="((?:https:\/\/flixlatam\.com)?\/(?:serie|anime|pelicula)\/[^"/?#]+)"[^>]*>[\s\S]{0,400}?<img[^>]+src="([^"]+)"[^>]*(?:alt="([^"]*)")?/gi;
@@ -194,7 +197,6 @@ function parseItems(html) {
   return items;
 }
 
-/** Últimos episodios: link to specific cap, show as series item pointing to series root */
 function parseLatestEpisodes(html) {
   var items = [];
   var seen = {};
@@ -206,11 +208,9 @@ function parseLatestEpisodes(html) {
     var path = pathFromUrl(href);
     if (seen[path]) continue;
     seen[path] = true;
-
     var poster = abs(m[2]);
     var alt = strip(m[3] || "");
     var title = strip(m[4] || m[5] || alt);
-    // episode badge T2E19
     var badge = "";
     var bm = path.match(/\/temporada\/(\d+)\/capitulo\/(\d+)/i);
     if (bm) badge = "T" + bm[1] + "E" + bm[2];
@@ -218,8 +218,6 @@ function parseLatestEpisodes(html) {
       title = title + " — " + badge;
     }
     if (!title) title = alt || path;
-
-    // ref to series root so episodes() lists all
     var seriesPath = path.replace(/\/temporada\/.*$/i, "");
     items.push({
       id: makeId(path.replace(/^\//, "").replace(/\//g, "-")),
@@ -232,8 +230,6 @@ function parseLatestEpisodes(html) {
       genres: /\/anime\//i.test(path) ? ["anime"] : ["series"],
     });
   }
-
-  // looser fallback
   if (items.length === 0) {
     var re2 =
       /href="([^"]+\/(?:serie|anime)\/[^"]+\/temporada\/(\d+)\/capitulo\/(\d+))"[^>]*>[\s\S]{0,500}?<img[^>]+src="([^"]+)"[^>]*(?:alt="([^"]*)")?/gi;
@@ -264,16 +260,21 @@ function parseLatestEpisodes(html) {
 function parsePageItems(html, basePath) {
   var items = parseItems(html);
   var next = null;
-  var pageM = html.match(/href="([^"]*[?&]page=(\d+)[^"]*)"[^>]*>\s*(?:›|»|Siguiente|Next)/i);
+  var pageM = html.match(
+    /href="([^"]*[?&]page=(\d+)[^"]*)"[^>]*>\s*(?:›|»|Siguiente|Next)/i
+  );
   if (pageM) {
     next = pageM[1];
-    if (next.indexOf("http") !== 0 && next.charAt(0) !== "/") next = basePath + next;
+    if (next.indexOf("http") !== 0 && next.charAt(0) !== "/")
+      next = basePath + next;
   } else {
-    // numbered pagination: current page + 1
     var cur = 1;
     var curM = (basePath || "").match(/[?&]page=(\d+)/);
     if (curM) cur = parseInt(curM[1], 10);
-    if (html.indexOf("page=" + (cur + 1)) >= 0 || html.indexOf("?page=" + (cur + 1)) >= 0) {
+    if (
+      html.indexOf("page=" + (cur + 1)) >= 0 ||
+      html.indexOf("?page=" + (cur + 1)) >= 0
+    ) {
       var bp = (basePath || "/").split("?")[0];
       next = bp + "?page=" + (cur + 1);
     }
@@ -281,10 +282,8 @@ function parsePageItems(html, basePath) {
   return { items: items, next: next };
 }
 
-/** Player options: name + iframe src */
 function parsePlayers(html) {
   var players = [];
-  // titles in order
   var titles = [];
   var tr = /id="playerOptions"[\s\S]*?<\/ul>/i.exec(html);
   if (tr) {
@@ -292,7 +291,6 @@ function parsePlayers(html) {
     var reT = /<span class="title">([^<]+)<\/span>/gi;
     while ((tm = reT.exec(tr[0])) !== null) titles.push(strip(tm[1]));
   }
-  // iframes in player-* boxes
   var iframes = [];
   var ir = /id="player-(\d+)"[\s\S]*?<iframe[^>]+src=["']([^"']+)["']/gi;
   var im;
@@ -308,7 +306,6 @@ function parsePlayers(html) {
       url: iframes[i].src,
     });
   }
-  // fallback any iframe
   if (players.length === 0) {
     var any = /<iframe[^>]+src=["']([^"']+)["']/gi;
     var am;
@@ -326,26 +323,27 @@ function parsePlayers(html) {
 function langLabel(code) {
   var c = String(code || "").toUpperCase();
   if (c === "LAT" || c === "LA" || c === "LATINO") return "Latino";
-  if (c === "ESP" || c === "ES" || c === "CAST" || c === "CASTELLANO") return "Castellano";
+  if (c === "ESP" || c === "ES" || c === "CAST" || c === "CASTELLANO")
+    return "Castellano";
   if (c === "SUB" || c === "VOSE" || c === "SUBS") return "Subtitulado";
-  if (c === "ENG" || c === "EN" || c === "ENG") return "Inglés";
+  if (c === "ENG" || c === "EN") return "Inglés";
   return c || "Audio";
 }
 
 function serverLabel(name) {
   var n = String(name || "").toLowerCase();
-  if (/streamwish|wish/.test(n)) return "Streamwish";
+  if (/streamwish|wish|hglink|swhoi|strwish/.test(n)) return "Streamwish";
   if (/voe/.test(n)) return "Voe";
   if (/filemoon|moon/.test(n)) return "Filemoon";
-  if (/vidhide|hide/.test(n)) return "Vidhide";
+  if (/vidhide|hide|morencius|earnvids/.test(n)) return "Vidhide";
   if (/dood/.test(n)) return "Doodstream";
+  if (/rapid/.test(n)) return "Rapidvideo";
   if (/embed69|embed/.test(n)) return "Embed69";
   if (/moe/.test(n)) return "Moe";
   if (/netu|waaw|hqq/.test(n)) return "Netu";
   return name || "Servidor";
 }
 
-/** Prefer order helpers */
 function preferScore(label, preferLang, preferServer) {
   var s = 0;
   var L = String(preferLang || "auto").toUpperCase();
@@ -355,62 +353,309 @@ function preferScore(label, preferLang, preferServer) {
     if (L === "LAT" && /latino/.test(lab)) s += 100;
     if (L === "ESP" && /castellano/.test(lab)) s += 100;
     if (L === "SUB" && /subtit/.test(lab)) s += 100;
-    if (L === "ENG" && /ingl[eé]s|english/.test(lab)) s += 100;
+    if (L === "ENG" && /ingl|english/.test(lab)) s += 100;
   } else {
     if (/latino/.test(lab)) s += 50;
+    if (/castellano/.test(lab)) s += 40;
   }
-  if (S !== "auto") {
-    if (lab.indexOf(S) >= 0) s += 40;
-  }
-  if (/streamwish/.test(lab)) s += 5;
-  if (/voe/.test(lab)) s += 4;
-  if (/filemoon/.test(lab)) s += 3;
+  if (S !== "auto" && lab.indexOf(S) >= 0) s += 40;
+  if (/streamwish/.test(lab)) s += 8;
+  if (/voe/.test(lab)) s += 6;
+  if (/filemoon/.test(lab)) s += 4;
+  if (/vidhide/.test(lab)) s += 2;
   return s;
 }
 
-async function captureStream(pageUrl, referer) {
-  if (!kino.browser || !kino.browser.capture) return null;
-  try {
-    var cap = await kino.browser.capture(pageUrl, {
-      timeoutMs: 25000,
-      headers: hdr({ Referer: referer || BASE + "/" }),
-    });
-    var urls = (cap && (cap.urls || cap.streams || cap)) || [];
-    if (!Array.isArray(urls)) urls = [];
-    // prefer m3u8 then mp4
-    var best = null;
-    for (var i = 0; i < urls.length; i++) {
-      var u = typeof urls[i] === "string" ? urls[i] : urls[i].url || urls[i].src;
-      if (!u) continue;
-      if (/\.m3u8(\?|$)/i.test(u)) return { url: u, mime: "application/x-mpegURL" };
-      if (/\.mp4(\?|$)/i.test(u) && !best) best = { url: u, mime: "video/mp4" };
-      if (!best && /video|stream|play/i.test(u)) best = { url: u };
+/* ─── Embed69 PoW + AES ─── */
+
+function solvePoW(challenge, difficulty, salt) {
+  var prefix = "";
+  for (var i = 0; i < difficulty; i++) prefix += "0";
+  var nonce = 0;
+  var max = 2000000;
+  while (nonce < max) {
+    var h = kino.crypto.hash("sha256", challenge + String(nonce));
+    if (h.indexOf(prefix) === 0) {
+      var keyHex = kino.crypto.hash(
+        "sha256",
+        challenge + String(nonce) + salt
+      );
+      return keyHex;
     }
-    return best;
+    nonce++;
+  }
+  return null;
+}
+
+function decryptLink(encB64, keyHex) {
+  try {
+    // raw = iv(16) || ciphertext ; key is 32 bytes from sha256
+    var rawB64 = encB64.replace(/\s/g, "");
+    // decode to get iv + ct - kino.crypto.decrypt needs data as base64 of ciphertext only with separate iv
+    // We need to split: use atob
+    var bin = atob(rawB64);
+    var ivBytes = [];
+    var ctChars = [];
+    for (var i = 0; i < bin.length; i++) {
+      if (i < 16) ivBytes.push(bin.charCodeAt(i));
+      else ctChars.push(bin.charAt(i));
+    }
+    var ivHex = "";
+    for (var j = 0; j < ivBytes.length; j++) {
+      var hx = ivBytes[j].toString(16);
+      ivHex += hx.length === 1 ? "0" + hx : hx;
+    }
+    var ctB64 = btoa(ctChars.join(""));
+    var plain = kino.crypto.decrypt("aes-256-cbc", {
+      key: keyHex,
+      keyEncoding: "hex",
+      iv: ivHex,
+      ivEncoding: "hex",
+      data: ctB64,
+    });
+    return plain;
   } catch (e) {
     return null;
   }
 }
 
-async function tryDirectFromEmbed(embedUrl) {
-  // Some hosts expose file in HTML without PoW when fetched with right UA
+function parseDataLink(html) {
+  var m = html.match(/let\s+dataLink\s*=\s*(\[[\s\S]*?\]);/);
+  if (!m) return [];
   try {
-    var html = await get(embedUrl, BASE + "/");
-    var m3u = html.match(/https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/i);
-    if (m3u) return { url: m3u[0].replace(/\\u0026/g, "&"), mime: "application/x-mpegURL" };
-    var mp4 = html.match(/https?:\/\/[^"'\s<>]+\.mp4[^"'\s<>]*/i);
-    if (mp4) return { url: mp4[0].replace(/\\u0026/g, "&"), mime: "video/mp4" };
-    // jwplayer / sources
-    var file = html.match(/["']file["']\s*:\s*["'](https?:\/\/[^"']+)["']/i);
-    if (file) {
-      var fu = file[1].replace(/\\u0026/g, "&");
-      return {
-        url: fu,
-        mime: /\.m3u8/i.test(fu) ? "application/x-mpegURL" : "video/mp4",
-      };
+    // JSON-ish (already valid JSON from site)
+    return JSON.parse(m[1]);
+  } catch (e) {
+    return [];
+  }
+}
+
+function parsePoW(html) {
+  var ch = html.match(/POW_CHALLENGE\s*=\s*['"]([^'"]+)['"]/);
+  var df = html.match(/POW_DIFFICULTY\s*=\s*(\d+)/);
+  var sa = html.match(/POW_SALT\s*=\s*['"]([^'"]+)['"]/);
+  if (!ch || !df || !sa) return null;
+  return {
+    challenge: ch[1],
+    difficulty: parseInt(df[1], 10),
+    salt: sa[1],
+  };
+}
+
+/** Decrypt all embeds from an embed69/vidurl page */
+function decryptEmbed69Page(html) {
+  var pow = parsePoW(html);
+  var data = parseDataLink(html);
+  if (!pow || !data.length) return [];
+  var keyHex = solvePoW(pow.challenge, pow.difficulty, pow.salt);
+  if (!keyHex) return [];
+  var out = [];
+  for (var i = 0; i < data.length; i++) {
+    var file = data[i];
+    var lang = langLabel(file.video_language);
+    var embeds = file.sortedEmbeds || [];
+    for (var j = 0; j < embeds.length; j++) {
+      var e = embeds[j];
+      var url = decryptLink(e.link, keyHex);
+      if (url && url.indexOf("http") === 0) {
+        out.push({
+          lang: lang,
+          server: serverLabel(e.servername),
+          serverRaw: e.servername,
+          url: url,
+        });
+      }
     }
-  } catch (e) {}
+  }
+  return out;
+}
+
+/* ─── Host extractors ─── */
+
+function toBase(n, base) {
+  var digits =
+    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  if (n === 0) return "0";
+  var s = "";
+  while (n > 0) {
+    s = digits.charAt(n % base) + s;
+    n = Math.floor(n / base);
+  }
+  return s;
+}
+
+/** Dean Edwards packer unpack (streamwish family) */
+function unpackPacker(html) {
+  var m = html.match(
+    /\}\s*\(\s*'((?:\\'|[^'])*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:\\'|[^'])*)'\s*\.split\s*\(\s*'\|'\s*\)/
+  );
+  if (!m) {
+    m = html.match(
+      /\}\s*\(\s*"((?:\\"|[^"])*)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*"((?:\\"|[^"])*)"\s*\.split\s*\(\s*"\|"\s*\)/
+    );
+  }
+  if (!m) return "";
+  var payload = m[1]
+    .replace(/\\'/g, "'")
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\");
+  var a = parseInt(m[2], 10);
+  var c = parseInt(m[3], 10);
+  var keywords = m[4].split("|");
+  var d = {};
+  while (c--) {
+    if (keywords[c]) d[toBase(c, a)] = keywords[c];
+  }
+  var out = payload.replace(/\b\w+\b/g, function (w) {
+    return d[w] != null ? d[w] : w;
+  });
+  return out;
+}
+
+function findStreamInText(text) {
+  if (!text) return null;
+  var m3u = text.match(/https?:\/\/[^"'\s\\<>]+\\.m3u8[^"'\s\\<>]*/i);
+  if (!m3u) m3u = text.match(/https?:\/\/[^"'\s\\<>]+m3u8[^"'\s\\<>]*/i);
+  if (m3u) {
+    return {
+      url: m3u[0].replace(/\\u0026/g, "&").replace(/\\/g, ""),
+      mime: "application/x-mpegURL",
+    };
+  }
+  var mp4 = text.match(/https?:\/\/[^"'\s\\<>]+\.mp4[^"'\s\\<>]*/i);
+  if (mp4) {
+    return {
+      url: mp4[0].replace(/\\u0026/g, "&").replace(/\\/g, ""),
+      mime: "video/mp4",
+    };
+  }
+  var file = text.match(/["']file["']\s*:\s*["'](https?:\/\/[^"']+)["']/i);
+  if (file) {
+    var fu = file[1].replace(/\\u0026/g, "&");
+    return {
+      url: fu,
+      mime: /\.m3u8/i.test(fu) ? "application/x-mpegURL" : "video/mp4",
+    };
+  }
   return null;
+}
+
+async function extractFromStreamwish(embedUrl) {
+  // try known mirrors
+  var idM = embedUrl.match(/\/(?:e|v|f)\/([a-z0-9]+)/i);
+  var id = idM ? idM[1] : null;
+  var urls = [embedUrl];
+  if (id) {
+    urls = urls.concat([
+      "https://swhoi.com/e/" + id,
+      "https://hglink.to/e/" + id,
+      "https://strwish.com/e/" + id,
+      "https://streamwish.to/e/" + id,
+    ]);
+  }
+  for (var i = 0; i < urls.length; i++) {
+    var html = await getSoft(urls[i], "https://embed69.org/");
+    if (!html || html.length < 500) continue;
+    var stream = findStreamInText(html);
+    if (stream) return stream;
+    var unpacked = unpackPacker(html);
+    if (unpacked) {
+      stream = findStreamInText(unpacked);
+      if (stream) return stream;
+    }
+  }
+  return null;
+}
+
+async function extractFromVoe(embedUrl) {
+  var html = await getSoft(embedUrl, "https://embed69.org/");
+  if (!html) return null;
+  var stream = findStreamInText(html);
+  if (stream) return stream;
+  // voe often stores obfuscated source
+  var m = html.match(
+    /(?:var|let|const)\s+\w+\s*=\s*['"]([A-Za-z0-9+/=]{40,})['"]/
+  );
+  if (m) {
+    try {
+      var dec = atob(m[1]);
+      stream = findStreamInText(dec);
+      if (stream) return stream;
+    } catch (e) {}
+  }
+  // prompt('...') pattern
+  var p = html.match(/prompt\s*\(\s*['"]([A-Za-z0-9+/=]+)['"]/);
+  if (p) {
+    try {
+      stream = findStreamInText(atob(p[1]));
+      if (stream) return stream;
+    } catch (e) {}
+  }
+  return null;
+}
+
+async function extractFromGeneric(embedUrl) {
+  var html = await getSoft(embedUrl, "https://embed69.org/");
+  if (!html) return null;
+  var stream = findStreamInText(html);
+  if (stream) return stream;
+  var unpacked = unpackPacker(html);
+  if (unpacked) {
+    stream = findStreamInText(unpacked);
+    if (stream) return stream;
+  }
+  return null;
+}
+
+async function extractStreamFromEmbed(embed) {
+  var url = embed.url;
+  var host = "";
+  try {
+    host = url.split("/")[2] || "";
+  } catch (e) {}
+  var stream = null;
+  if (
+    /streamwish|hglink|swhoi|strwish|wish/i.test(host + embed.serverRaw + embed.server)
+  ) {
+    stream = await extractFromStreamwish(url);
+  } else if (/voe/i.test(host + embed.serverRaw + embed.server)) {
+    stream = await extractFromVoe(url);
+  } else {
+    stream = await extractFromGeneric(url);
+    if (!stream && /wish|hglink|swhoi/i.test(url)) {
+      stream = await extractFromStreamwish(url);
+    }
+  }
+  if (stream) {
+    stream.label = embed.lang + " · " + embed.server;
+    stream.headers = {
+      Referer: url,
+      "User-Agent": UA,
+    };
+  }
+  return stream;
+}
+
+/** From a vidurl/embed69 player page → list of playable streams */
+async function resolvePlayerPage(playerUrl) {
+  var html = await getSoft(playerUrl, BASE + "/");
+  if (!html) return [];
+  var embeds = decryptEmbed69Page(html);
+  // also if page is already an intermediate without POW (rare)
+  if (!embeds.length) {
+    var direct = findStreamInText(html);
+    if (direct) return [direct];
+  }
+  var streams = [];
+  // limit to avoid blowing request budget (60 max)
+  var max = Math.min(embeds.length, 6);
+  for (var i = 0; i < max; i++) {
+    try {
+      var s = await extractStreamFromEmbed(embeds[i]);
+      if (s && s.url) streams.push(s);
+    } catch (e) {}
+  }
+  return streams;
 }
 
 export async function search(query) {
@@ -426,9 +671,7 @@ export async function search(query) {
   var html = await get(path);
   var parsed = parsePageItems(html, path);
   var items = rank(parsed.items, q);
-  if (parsed.next) {
-    return { items: items, next: parsed.next };
-  }
+  if (parsed.next) return { items: items, next: parsed.next };
   return items;
 }
 
@@ -447,20 +690,18 @@ export async function home() {
     });
   }
 
-  // Split remaining sections by headers in HTML order
-  // Películas / Series / Anime blocks
   function sectionItems(label) {
-    var idx = html.search(new RegExp("<h[12][^>]*>\\s*(?:<[^>]+>\\s*)*" + label, "i"));
+    var idx = html.search(
+      new RegExp("<h[12][^>]*>\\s*(?:<[^>]+>\\s*)*" + label, "i")
+    );
     if (idx < 0) return [];
-    var chunk = html.slice(idx, idx + 25000);
-    return parseItems(chunk).slice(0, 24);
+    return parseItems(html.slice(idx, idx + 25000)).slice(0, 24);
   }
 
   var pelis = sectionItems("Películas");
   if (!pelis.length) {
     try {
-      var ph = await get("/peliculas");
-      pelis = parseItems(ph).slice(0, 24);
+      pelis = parseItems(await get("/peliculas")).slice(0, 24);
     } catch (e) {}
   }
   if (pelis.length) {
@@ -476,8 +717,7 @@ export async function home() {
   var series = sectionItems("Series");
   if (!series.length) {
     try {
-      var sh = await get("/series");
-      series = parseItems(sh).slice(0, 24);
+      series = parseItems(await get("/series")).slice(0, 24);
     } catch (e) {}
   }
   if (series.length) {
@@ -493,8 +733,7 @@ export async function home() {
   var anime = sectionItems("Anime");
   if (!anime.length) {
     try {
-      var ah = await get("/animes");
-      anime = parseItems(ah).slice(0, 24);
+      anime = parseItems(await get("/animes")).slice(0, 24);
     } catch (e) {}
   }
   if (anime.length) {
@@ -507,10 +746,8 @@ export async function home() {
     });
   }
 
-  // Populares
   try {
-    var pop = await get("/series/populares");
-    var popItems = parseItems(pop).slice(0, 24);
+    var popItems = parseItems(await get("/series/populares")).slice(0, 24);
     if (popItems.length) {
       rows.push({
         id: "populares",
@@ -522,12 +759,10 @@ export async function home() {
     }
   } catch (e) {}
 
-  if (rows.length === 0 && latest.length === 0) {
-    // last resort: any items on home
+  if (!rows.length) {
     var any = parseItems(html).slice(0, 24);
-    if (any.length) {
+    if (any.length)
       rows.push({ id: "inicio", title: "Inicio", items: any, ref: "/" });
-    }
   }
   return rows;
 }
@@ -537,9 +772,7 @@ export async function browse(ref, cursor) {
   if (cursor) path = cursor;
   if (path.indexOf("http") === 0) path = pathFromUrl(path);
   if (path === "/?section=ultimos") {
-    var h = await get("/");
-    var latest = parseLatestEpisodes(h);
-    return { items: latest, next: null };
+    return { items: parseLatestEpisodes(await get("/")), next: null };
   }
   var html = await get(path);
   var parsed = parsePageItems(html, path);
@@ -549,7 +782,6 @@ export async function browse(ref, cursor) {
 export async function episodes(ref) {
   var path = ref;
   if (path.indexOf("http") === 0) path = pathFromUrl(path);
-  // normalize to series/anime root
   path = path.replace(/\/temporada\/.*$/i, "").replace(/\/$/, "");
   var html = await get(path);
 
@@ -563,7 +795,9 @@ export async function episodes(ref) {
       .trim();
   }
   var poster = "";
-  var pm = html.match(/class="poster"[\s\S]{0,400}?<img[^>]+src="([^"]+)"/i);
+  var pm = html.match(
+    /class="poster"[\s\S]{0,400}?<img[^>]+src="([^"]+)"/i
+  );
   if (pm) poster = abs(pm[1]);
   var overview = "";
   var om = html.match(/class="wp-content"[^>]*>([\s\S]*?)<\/div>/i);
@@ -593,7 +827,6 @@ export async function episodes(ref) {
     return a.number - b.number;
   });
 
-  // movie: no episodes — resolve will use the same ref
   if (eps.length === 0 && /\/pelicula\//i.test(path)) {
     return {
       series: { title: title, poster: poster, overview: overview },
@@ -619,34 +852,6 @@ export async function episodes(ref) {
 }
 
 export async function resolve(ref) {
-  var path = ref;
-  var isLazy = false;
-  var forcePlayer = null;
-
-  if (String(ref).indexOf("play:") === 0) {
-    // play:<base64url of player url>|<label>
-    isLazy = true;
-    var raw = String(ref).slice(5);
-    var parts = raw.split("|");
-    path = parts[0];
-    try {
-      // not real b64url always — we store absolute URL encoded
-      path = decodeURIComponent(parts[0]);
-    } catch (e) {
-      path = parts[0];
-    }
-    forcePlayer = path;
-  } else if (String(ref).indexOf("ep:") === 0) {
-    path = String(ref).slice(3);
-  }
-
-  if (path.indexOf("http") === 0 && path.indexOf("flixlatam.com") < 0) {
-    // direct embed resolve
-    forcePlayer = path;
-  } else if (path.indexOf("http") === 0) {
-    path = pathFromUrl(path);
-  }
-
   var preferLang = "LAT";
   var preferServer = "auto";
   try {
@@ -656,121 +861,109 @@ export async function resolve(ref) {
     }
   } catch (e) {}
 
-  // Resolve a specific embed/player URL
-  if (forcePlayer) {
-    var direct = await tryDirectFromEmbed(forcePlayer);
-    if (direct && direct.url) {
+  // Lazy alternative: play:<urlencoded embed url>
+  if (String(ref).indexOf("play:") === 0) {
+    var embedUrl = decodeURIComponent(String(ref).slice(5));
+    var one = await extractStreamFromEmbed({
+      url: embedUrl,
+      server: serverLabel(embedUrl),
+      serverRaw: "",
+      lang: "Audio",
+    });
+    if (one && one.url) {
       return {
-        url: direct.url,
-        mime: direct.mime,
-        headers: { Referer: forcePlayer, "User-Agent": UA },
-        label: "Directo",
+        url: one.url,
+        mime: one.mime,
+        headers: one.headers || { Referer: embedUrl, "User-Agent": UA },
+        label: one.label,
       };
     }
-    var cap = await captureStream(forcePlayer, BASE + "/");
-    if (cap && cap.url) {
+    // try as embed69 page
+    var fromPage = await resolvePlayerPage(embedUrl);
+    if (fromPage.length) {
       return {
-        url: cap.url,
-        mime: cap.mime,
-        headers: { Referer: forcePlayer, "User-Agent": UA },
-        label: "Capturado",
+        url: fromPage[0].url,
+        mime: fromPage[0].mime,
+        headers: fromPage[0].headers || {
+          Referer: embedUrl,
+          "User-Agent": UA,
+        },
+        label: fromPage[0].label,
       };
     }
-    // last resort: return embed as-is (Kino may still fail; alternatives help)
-    throw kino.error("unavailable", "no stream", {
-      userMessage: "No se pudo extraer el video de este servidor. Prueba otro en el menú.",
+    throw kino.error("unavailable", "lazy failed", {
+      userMessage: "Este servidor no respondió. Prueba otra fuente.",
     });
   }
 
-  // Load episode/movie page
-  var pagePath = path.replace(/\/$/, "");
+  var path = ref;
+  if (String(ref).indexOf("ep:") === 0) path = String(ref).slice(3);
+  if (path.indexOf("http") === 0 && path.indexOf("flixlatam.com") >= 0) {
+    path = pathFromUrl(path);
+  }
+
+  var pagePath = String(path).replace(/\/$/, "");
   var html = await get(pagePath);
   var players = parsePlayers(html);
 
-  if (players.length === 0) {
+  if (!players.length) {
     throw kino.error("unavailable", "no players", {
       userMessage: "No hay servidores disponibles para este título.",
     });
   }
 
-  // Build alternatives: each player as lazy copy + try capture first preferred
-  var alternatives = [];
-  for (var i = 0; i < players.length; i++) {
-    var p = players[i];
-    var label = serverLabel(p.name);
-    // Assume latino as site default
-    var fullLabel = "Latino · " + label;
-    alternatives.push({
-      ref: "play:" + encodeURIComponent(p.url),
-      label: fullLabel,
-    });
-  }
+  var allStreams = [];
+  var embedAlts = [];
 
-  // Sort alternatives by preference
-  alternatives.sort(function (a, b) {
-    return preferScore(b.label, preferLang, preferServer) - preferScore(a.label, preferLang, preferServer);
-  });
-
-  // Try to resolve the preferred one now
-  var primary = null;
-  for (var j = 0; j < players.length; j++) {
-    var cand = players[j];
-    var score = preferScore("Latino · " + serverLabel(cand.name), preferLang, preferServer);
-    var direct2 = await tryDirectFromEmbed(cand.url);
-    if (direct2 && direct2.url) {
-      primary = {
-        url: direct2.url,
-        mime: direct2.mime,
-        headers: { Referer: cand.url, "User-Agent": UA },
-        label: "Latino · " + serverLabel(cand.name),
-        _score: score,
-      };
-      break;
-    }
-    var cap2 = await captureStream(cand.url, pagePath);
-    if (cap2 && cap2.url) {
-      primary = {
-        url: cap2.url,
-        mime: cap2.mime,
-        headers: { Referer: cand.url, "User-Agent": UA },
-        label: "Latino · " + serverLabel(cand.name),
-        _score: score,
-      };
-      break;
-    }
-  }
-
-  if (primary) {
-    var alts = [];
-    for (var k = 0; k < alternatives.length; k++) {
-      if (alternatives[k].label !== primary.label) alts.push(alternatives[k]);
-    }
-    return {
-      url: primary.url,
-      mime: primary.mime,
-      headers: primary.headers,
-      label: primary.label,
-      alternatives: alts.length ? alts : undefined,
-    };
-  }
-
-  // No direct stream yet — return first alternative as lazy via first ref resolve
-  // Kino will call resolve again with play: ref when user picks
-  if (alternatives.length) {
-    // Force resolve first alternative recursively once
+  for (var p = 0; p < players.length; p++) {
+    var player = players[p];
     try {
-      var first = await resolve(alternatives[0].ref);
-      if (first && first.url) {
-        var rest = alternatives.slice(1);
-        first.alternatives = rest.length ? rest : first.alternatives;
-        first.label = first.label || alternatives[0].label;
-        return first;
+      var streams = await resolvePlayerPage(player.url);
+      for (var s = 0; s < streams.length; s++) {
+        allStreams.push(streams[s]);
       }
+      // keep embed page as fallback alternative
+      embedAlts.push({
+        ref: "play:" + encodeURIComponent(player.url),
+        label: "Embed · " + serverLabel(player.name),
+      });
     } catch (e) {}
   }
 
-  throw kino.error("unavailable", "extract failed", {
-    userMessage:
-      "No se pudo obtener el video. Prueba otro servidor en el menú de fuentes.",
+  if (!allStreams.length) {
+    throw kino.error("unavailable", "extract failed", {
+      userMessage:
+        "No se pudo obtener el video. Prueba otro servidor en el menú de fuentes.",
+    });
+  }
+
+  allStreams.sort(function (a, b) {
+    return (
+      preferScore(b.label, preferLang, preferServer) -
+      preferScore(a.label, preferLang, preferServer)
+    );
   });
+
+  var primary = allStreams[0];
+  var alternatives = [];
+  for (var i = 1; i < allStreams.length; i++) {
+    alternatives.push({
+      url: allStreams[i].url,
+      mime: allStreams[i].mime,
+      headers: allStreams[i].headers,
+      label: allStreams[i].label,
+    });
+  }
+  // append embed fallbacks not already covered
+  for (var a = 0; a < embedAlts.length; a++) {
+    alternatives.push(embedAlts[a]);
+  }
+
+  return {
+    url: primary.url,
+    mime: primary.mime || "application/x-mpegURL",
+    headers: primary.headers || { "User-Agent": UA },
+    label: primary.label,
+    alternatives: alternatives.length ? alternatives : undefined,
+  };
 }
