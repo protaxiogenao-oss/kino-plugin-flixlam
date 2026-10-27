@@ -1,6 +1,6 @@
 /// <reference path="./kino.d.ts" />
 /**
- * FlixLatam plugin for Kino — v1.2.0
+ * FlixLatam plugin for Kino — v1.2.1
  * Series, películas y anime en latino (flixlatam.com)
  * Resolve: PoW + AES (Embed69) → Streamwish/Voe/Vidhide → m3u8
  */
@@ -71,16 +71,40 @@ function abs(u) {
   return BASE + "/" + u;
 }
 
-/** Poster vertical (2:3). Fuerza tamaño poster de TMDB y evita backdrop horizontal. */
-function portraitPoster(u) {
+/**
+ * FlixLatam casi solo publica pósters verticales (2:3) en listados.
+ * Las stills 16:9 aparecen en páginas de episodio.
+ * - verticalPoster: detalle / catálogo clásico
+ * - horizontalBackdrop: filas de Inicio (Kino usa backdrop en tarjetas apaisadas)
+ *   Misma imagen en w780: mejor nitidez; si la fuente es vertical Kino letterbox/ajusta
+ *   sin un recorte extremo tipo thumbnail cuadrado.
+ */
+function tmdbSize(u, size) {
   if (!u) return undefined;
   var url = abs(u);
-  // TMDB: usar w342/w500 (poster vertical); original a veces es backdrop apaisado
-  url = url.replace(
-    /image\.tmdb\.org\/t\/p\/(?:original|w\d+|h\d+)\//i,
-    "image.tmdb.org/t/p/w500/"
-  );
+  if (/image\.tmdb\.org\/t\/p\//i.test(url)) {
+    url = url.replace(
+      /image\.tmdb\.org\/t\/p\/(?:original|w\d+|h\d+)\//i,
+      "image.tmdb.org/t/p/" + size + "/"
+    );
+  }
   return url;
+}
+function verticalPoster(u) {
+  return tmdbSize(u, "w500");
+}
+function horizontalBackdrop(u) {
+  // w780 se acerca a ancho de tarjetas 16:9; original si no es TMDB
+  var url = tmdbSize(u, "w780");
+  if (url) return url;
+  return abs(u) || undefined;
+}
+function applyImages(item, rawUrl, landscapeUrl) {
+  var poster = verticalPoster(rawUrl);
+  var back = horizontalBackdrop(landscapeUrl || rawUrl);
+  if (poster) item.poster = poster;
+  if (back) item.backdrop = back;
+  return item;
 }
 
 function makeId(s) {
@@ -170,16 +194,19 @@ function parseItems(html) {
       title = slug.replace(/-[a-zA-Z0-9]{5,}$/, "").replace(/-/g, " ");
     }
     title = title.replace(/^Ver\s+/i, "").replace(/\s+online$/i, "").trim();
-    var poster = portraitPoster(m[3]);
     var kind = kindFromUrl(href);
-    items.push({
-      id: makeId(path.replace(/^\//, "").replace(/\//g, "-")),
-      ref: path,
-      title: title,
-      kind: kind,
-      poster: poster,
-      genres: kind === "movie" ? ["movies"] : /\/anime\//i.test(href) ? ["anime"] : ["series"],
-    });
+    items.push(
+      applyImages(
+        {
+          id: makeId(path.replace(/^\//, "").replace(/\//g, "-")),
+          ref: path,
+          title: title,
+          kind: kind,
+          genres: kind === "movie" ? ["movies"] : /\/anime\//i.test(href) ? ["anime"] : ["series"],
+        },
+        m[3]
+      )
+    );
   }
   if (items.length === 0) {
     var re2 =
@@ -195,13 +222,17 @@ function parseItems(html) {
         title2 = slug2.replace(/-[a-zA-Z0-9]{5,}$/, "").replace(/-/g, " ");
       }
       title2 = title2.replace(/^Ver\s+/i, "").replace(/\s+online$/i, "").trim();
-      items.push({
-        id: makeId(path2.replace(/^\//, "").replace(/\//g, "-")),
-        ref: path2,
-        title: title2,
-        kind: kindFromUrl(href2),
-        poster: portraitPoster(m[2]),
-      });
+      items.push(
+        applyImages(
+          {
+            id: makeId(path2.replace(/^\//, "").replace(/\//g, "-")),
+            ref: path2,
+            title: title2,
+            kind: kindFromUrl(href2),
+          },
+          m[2]
+        )
+      );
     }
   }
   return items;
@@ -218,7 +249,6 @@ function parseLatestEpisodes(html) {
     var path = pathFromUrl(href);
     if (seen[path]) continue;
     seen[path] = true;
-    var poster = portraitPoster(m[2]);
     var alt = strip(m[3] || "");
     var title = strip(m[4] || m[5] || alt);
     var badge = "";
@@ -229,15 +259,19 @@ function parseLatestEpisodes(html) {
     }
     if (!title) title = alt || path;
     var seriesPath = path.replace(/\/temporada\/.*$/i, "");
-    items.push({
-      id: makeId(path.replace(/^\//, "").replace(/\//g, "-")),
-      ref: seriesPath,
-      title: title,
-      kind: "series",
-      poster: poster,
-      badges: badge ? [badge] : undefined,
-      genres: /\/anime\//i.test(path) ? ["anime"] : ["series"],
-    });
+    items.push(
+      applyImages(
+        {
+          id: makeId(path.replace(/^\//, "").replace(/\//g, "-")),
+          ref: seriesPath,
+          title: title,
+          kind: "series",
+          badges: badge ? [badge] : undefined,
+          genres: /\/anime\//i.test(path) ? ["anime"] : ["series"],
+        },
+        m[2]
+      )
+    );
   }
   if (items.length === 0) {
     var re2 =
@@ -252,14 +286,18 @@ function parseLatestEpisodes(html) {
       var title2 = strip(m[5] || "");
       if (title2 && title2.indexOf(badge2) < 0) title2 = title2 + " — " + badge2;
       if (!title2) title2 = badge2;
-      items.push({
-        id: makeId(path2.replace(/^\//, "").replace(/\//g, "-")),
-        ref: series2,
-        title: title2,
-        kind: "series",
-        poster: portraitPoster(m[4]),
-        badges: [badge2],
-      });
+      items.push(
+        applyImages(
+          {
+            id: makeId(path2.replace(/^\//, "").replace(/\//g, "-")),
+            ref: series2,
+            title: title2,
+            kind: "series",
+            badges: [badge2],
+          },
+          m[4]
+        )
+      );
     }
   }
   return items;
@@ -829,7 +867,8 @@ export async function episodes(ref) {
   var pm = html.match(
     /class="poster"[\s\S]{0,400}?<img[^>]+src="([^"]+)"/i
   );
-  if (pm) poster = portraitPoster(pm[1]);
+  if (pm) poster = verticalPoster(pm[1]);
+
   var overview = "";
   var om = html.match(/class="wp-content"[^>]*>([\s\S]*?)<\/div>/i);
   if (om) overview = strip(om[1]).slice(0, 600);
@@ -872,10 +911,21 @@ export async function episodes(ref) {
     };
   }
 
+  // Buscar still horizontal (16:9) en la página para backdrop de la serie
+  var backdrop = undefined;
+  var allImgs = html.match(/https:\/\/image\.tmdb\.org\/t\/p\/[^"'\s<>]+/g) || [];
+  // En fichas de episodio el póster del header suele ser still 16:9; en serie casi todo es vertical
+  if (/\/capitulo\//i.test(path) && allImgs.length) {
+    backdrop = horizontalBackdrop(allImgs[0]);
+  } else if (poster) {
+    backdrop = horizontalBackdrop(poster);
+  }
+
   return {
     series: {
       title: title || undefined,
       poster: poster || undefined,
+      backdrop: backdrop,
       overview: overview || undefined,
     },
     episodes: eps,
