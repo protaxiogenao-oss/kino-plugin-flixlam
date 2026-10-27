@@ -1,0 +1,93 @@
+{
+  "id": "flixlatam",
+  "name": "FlixLatam",
+  "version": "1.0.0",
+  "apiVersion": 6,
+  "entry": "plugin.js",
+  "description": "Hecho por Hotaru Yume - Series, películas y anime en latino",
+  "author": "Hotaru Yume",
+  "homepage": "https://flixlatam.com",
+  "browser": "pages",
+  "hosts": [
+    "flixlatam.com",
+    "*.flixlatam.com",
+    "embed69.org",
+    "*.embed69.org",
+    "image.tmdb.org",
+    "waaw.to",
+    "*.waaw.to",
+    "streamwish.com",
+    "*.streamwish.com",
+    "streamwish.to",
+    "*.streamwish.to",
+    "voe.sx",
+    "*.voe.sx",
+    "filemoon.sx",
+    "*.filemoon.sx",
+    "vidhidevip.com",
+    "*.vidhidevip.com",
+    "vidhidepre.com",
+    "*.vidhidepre.com",
+    "dood.watch",
+    "*.dood.watch",
+    "doodstream.com",
+    "*.doodstream.com",
+    "netu.tv",
+    "*.netu.tv",
+    "hqq.tv",
+    "*.hqq.tv"
+  ],
+  "streamHosts": "any",
+  "capabilities": [
+    "search",
+    "home",
+    "browse",
+    "episodes",
+    "resolve"
+  ],
+  "categories": [
+    "movies",
+    "series",
+    "anime"
+  ],
+  "color": "#1E40AF",
+  "icon": "icon.png",
+  "theme": {
+    "accent": "#3B82F6",
+    "onAccent": "#FFFFFF",
+    "background": "#0F172A",
+    "surface": "#1E293B",
+    "highlight": "#60A5FA"
+  },
+  "settings": [
+    {
+      "key": "preferLang",
+      "label": "Audio preferido",
+      "type": "select",
+      "default": "LAT",
+      "options": [
+        { "value": "LAT", "label": "Latino" },
+        { "value": "ESP", "label": "Castellano" },
+        { "value": "SUB", "label": "Subtitulado" },
+        { "value": "ENG", "label": "Inglés" },
+        { "value": "auto", "label": "Automático" }
+      ]
+    },
+    {
+      "key": "preferServer",
+      "label": "Servidor preferido",
+      "type": "select",
+      "default": "auto",
+      "options": [
+        { "value": "auto", "label": "Automático" },
+        { "value": "streamwish", "label": "Streamwish" },
+        { "value": "voe", "label": "Voe" },
+        { "value": "filemoon", "label": "Filemoon" },
+        { "value": "vidhide", "label": "Vidhide" },
+        { "value": "embed69", "label": "Embed69" },
+        { "value": "moe", "label": "Moe" },
+        { "value": "netu", "label": "Netu" }
+      ]
+    }
+  ]
+}
