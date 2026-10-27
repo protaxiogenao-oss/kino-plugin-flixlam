@@ -1,6 +1,6 @@
 /// <reference path="./kino.d.ts" />
 /**
- * FlixLatam plugin for Kino — v1.1.0
+ * FlixLatam plugin for Kino — v1.2.0
  * Series, películas y anime en latino (flixlatam.com)
  * Resolve: PoW + AES (Embed69) → Streamwish/Voe/Vidhide → m3u8
  */
@@ -69,6 +69,18 @@ function abs(u) {
   if (u.indexOf("http") === 0) return u;
   if (u.charAt(0) === "/") return BASE + u;
   return BASE + "/" + u;
+}
+
+/** Poster vertical (2:3). Fuerza tamaño poster de TMDB y evita backdrop horizontal. */
+function portraitPoster(u) {
+  if (!u) return undefined;
+  var url = abs(u);
+  // TMDB: usar w342/w500 (poster vertical); original a veces es backdrop apaisado
+  url = url.replace(
+    /image\.tmdb\.org\/t\/p\/(?:original|w\d+|h\d+)\//i,
+    "image.tmdb.org/t/p/w500/"
+  );
+  return url;
 }
 
 function makeId(s) {
@@ -158,7 +170,7 @@ function parseItems(html) {
       title = slug.replace(/-[a-zA-Z0-9]{5,}$/, "").replace(/-/g, " ");
     }
     title = title.replace(/^Ver\s+/i, "").replace(/\s+online$/i, "").trim();
-    var poster = abs(m[3]);
+    var poster = portraitPoster(m[3]);
     var kind = kindFromUrl(href);
     items.push({
       id: makeId(path.replace(/^\//, "").replace(/\//g, "-")),
@@ -166,7 +178,6 @@ function parseItems(html) {
       title: title,
       kind: kind,
       poster: poster,
-      backdrop: poster,
       genres: kind === "movie" ? ["movies"] : /\/anime\//i.test(href) ? ["anime"] : ["series"],
     });
   }
@@ -189,8 +200,7 @@ function parseItems(html) {
         ref: path2,
         title: title2,
         kind: kindFromUrl(href2),
-        poster: abs(m[2]),
-        backdrop: abs(m[2]),
+        poster: portraitPoster(m[2]),
       });
     }
   }
@@ -208,7 +218,7 @@ function parseLatestEpisodes(html) {
     var path = pathFromUrl(href);
     if (seen[path]) continue;
     seen[path] = true;
-    var poster = abs(m[2]);
+    var poster = portraitPoster(m[2]);
     var alt = strip(m[3] || "");
     var title = strip(m[4] || m[5] || alt);
     var badge = "";
@@ -225,7 +235,6 @@ function parseLatestEpisodes(html) {
       title: title,
       kind: "series",
       poster: poster,
-      backdrop: poster,
       badges: badge ? [badge] : undefined,
       genres: /\/anime\//i.test(path) ? ["anime"] : ["series"],
     });
@@ -248,8 +257,7 @@ function parseLatestEpisodes(html) {
         ref: series2,
         title: title2,
         kind: "series",
-        poster: abs(m[4]),
-        backdrop: abs(m[4]),
+        poster: portraitPoster(m[4]),
         badges: [badge2],
       });
     }
@@ -676,15 +684,37 @@ export async function search(query) {
 }
 
 export async function home() {
-  var html = await get("/");
-  var rows = [];
+  var used = {};
+  function take(list, n) {
+    var out = [];
+    for (var i = 0; i < list.length && out.length < n; i++) {
+      var it = list[i];
+      var key = it.ref || it.id;
+      if (used[key]) continue;
+      used[key] = true;
+      out.push(it);
+    }
+    return out;
+  }
 
-  var latest = parseLatestEpisodes(html);
+  async function loadPath(path, n) {
+    try {
+      var html = await get(path);
+      return take(parseItems(html), n || 20);
+    } catch (e) {
+      return [];
+    }
+  }
+
+  var rows = [];
+  var html = await get("/");
+
+  var latest = take(parseLatestEpisodes(html), 20);
   if (latest.length) {
     rows.push({
       id: "ultimos-episodios",
       title: "Últimos episodios",
-      items: latest.slice(0, 24),
+      items: latest,
       ref: "/?section=ultimos",
       genre: "series",
     });
@@ -695,72 +725,73 @@ export async function home() {
       new RegExp("<h[12][^>]*>\\s*(?:<[^>]+>\\s*)*" + label, "i")
     );
     if (idx < 0) return [];
-    return parseItems(html.slice(idx, idx + 25000)).slice(0, 24);
+    return parseItems(html.slice(idx, idx + 25000));
   }
 
-  var pelis = sectionItems("Películas");
-  if (!pelis.length) {
-    try {
-      pelis = parseItems(await get("/peliculas")).slice(0, 24);
-    } catch (e) {}
-  }
-  if (pelis.length) {
+  var pelisHome = take(sectionItems("Películas"), 20);
+  if (!pelisHome.length) pelisHome = await loadPath("/peliculas", 20);
+  if (pelisHome.length) {
     rows.push({
       id: "peliculas",
-      title: "Películas",
-      items: pelis,
+      title: "Películas recientes",
+      items: pelisHome,
       ref: "/peliculas",
       genre: "peliculas",
     });
   }
 
-  var series = sectionItems("Series");
-  if (!series.length) {
-    try {
-      series = parseItems(await get("/series")).slice(0, 24);
-    } catch (e) {}
-  }
-  if (series.length) {
+  var seriesHome = take(sectionItems("Series"), 20);
+  if (!seriesHome.length) seriesHome = await loadPath("/series", 20);
+  if (seriesHome.length) {
     rows.push({
       id: "series",
-      title: "Series",
-      items: series,
+      title: "Series recientes",
+      items: seriesHome,
       ref: "/series",
       genre: "series",
     });
   }
 
-  var anime = sectionItems("Anime");
-  if (!anime.length) {
-    try {
-      anime = parseItems(await get("/animes")).slice(0, 24);
-    } catch (e) {}
-  }
-  if (anime.length) {
+  var animeHome = take(sectionItems("Anime"), 20);
+  if (!animeHome.length) animeHome = await loadPath("/animes", 20);
+  if (animeHome.length) {
     rows.push({
       id: "anime",
-      title: "Anime",
-      items: anime,
+      title: "Anime reciente",
+      items: animeHome,
       ref: "/animes",
       genre: "anime",
     });
   }
 
-  try {
-    var popItems = parseItems(await get("/series/populares")).slice(0, 24);
-    if (popItems.length) {
+  var extras = [
+    { id: "pelis-pop", title: "Películas populares", path: "/peliculas/populares", genre: "peliculas" },
+    { id: "series-pop", title: "Series populares", path: "/series/populares", genre: "series" },
+    { id: "anime-pop", title: "Anime popular", path: "/animes/populares", genre: "anime" },
+    { id: "doramas", title: "Doramas", path: "/generos/dorama", genre: "series" },
+    { id: "accion", title: "Acción", path: "/generos/accion", genre: "peliculas" },
+    { id: "comedia", title: "Comedia", path: "/generos/comedia", genre: "peliculas" },
+    { id: "terror", title: "Terror", path: "/generos/terror", genre: "peliculas" },
+    { id: "drama", title: "Drama", path: "/generos/drama", genre: "series" },
+    { id: "ciencia-ficcion", title: "Ciencia ficción", path: "/generos/ciencia-ficcion", genre: "peliculas" },
+  ];
+
+  for (var e = 0; e < extras.length; e++) {
+    var ex = extras[e];
+    var items = await loadPath(ex.path, 18);
+    if (items.length >= 4) {
       rows.push({
-        id: "populares",
-        title: "Series populares",
-        items: popItems,
-        ref: "/series/populares",
-        genre: "series",
+        id: ex.id,
+        title: ex.title,
+        items: items,
+        ref: ex.path,
+        genre: ex.genre,
       });
     }
-  } catch (e) {}
+  }
 
   if (!rows.length) {
-    var any = parseItems(html).slice(0, 24);
+    var any = take(parseItems(html), 20);
     if (any.length)
       rows.push({ id: "inicio", title: "Inicio", items: any, ref: "/" });
   }
@@ -798,7 +829,7 @@ export async function episodes(ref) {
   var pm = html.match(
     /class="poster"[\s\S]{0,400}?<img[^>]+src="([^"]+)"/i
   );
-  if (pm) poster = abs(pm[1]);
+  if (pm) poster = portraitPoster(pm[1]);
   var overview = "";
   var om = html.match(/class="wp-content"[^>]*>([\s\S]*?)<\/div>/i);
   if (om) overview = strip(om[1]).slice(0, 600);
