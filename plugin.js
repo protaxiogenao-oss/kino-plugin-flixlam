@@ -1,6 +1,6 @@
 /// <reference path="./kino.d.ts" />
 /**
- * FlixLatam plugin for Kino — v1.2.1
+ * FlixLatam plugin for Kino — v1.3.0
  * Series, películas y anime en latino (flixlatam.com)
  * Resolve: PoW + AES (Embed69) → Streamwish/Voe/Vidhide → m3u8
  */
@@ -405,10 +405,10 @@ function preferScore(label, preferLang, preferServer) {
     if (/castellano/.test(lab)) s += 40;
   }
   if (S !== "auto" && lab.indexOf(S) >= 0) s += 40;
+  if (/vidhide/.test(lab)) s += 10;
   if (/streamwish/.test(lab)) s += 8;
-  if (/voe/.test(lab)) s += 6;
-  if (/filemoon/.test(lab)) s += 4;
-  if (/vidhide/.test(lab)) s += 2;
+  if (/filemoon/.test(lab)) s += 6;
+  if (/voe/.test(lab)) s += 4;
   return s;
 }
 
@@ -530,35 +530,66 @@ function toBase(n, base) {
   return s;
 }
 
-/** Dean Edwards packer unpack (streamwish family) */
+/** Unpack common JS packers used by Streamwish / Vidhide / Filemoon */
 function unpackPacker(html) {
-  var m = html.match(
-    /\}\s*\(\s*'((?:\\'|[^'])*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:\\'|[^'])*)'\s*\.split\s*\(\s*'\|'\s*\)/
-  );
+  if (!html) return "";
+  var out = "";
+
+  // Format A: while(c--) if(k[c]) p.replace(RegExp('\\b'+c.toString(a)+'\\b'), k[c])
+  var reA =
+    /eval\(function\(p,a,c,k,e,d\)\{while\(c--\)if\(k\[c\]\)p=p\.replace\(new RegExp\('\\\\b'\+c\.toString\(a\)\+'\\\\b','g'\),k\[c\]\);return p\}\('((?:\\'|[^'])*)',(\d+),(\d+),'((?:\\'|[^'])*)'\.split\('\|'\)/i;
+  var m = reA.exec(html);
+  if (m) {
+    try {
+      var payload = m[1].replace(/\\'/g, "'").replace(/\\\\/g, "\\");
+      var a = parseInt(m[2], 10);
+      var c = parseInt(m[3], 10);
+      var keywords = m[4].split("|");
+      while (c--) {
+        if (keywords[c]) {
+          payload = payload.replace(
+            new RegExp("\\b" + c.toString(a) + "\\b", "g"),
+            keywords[c]
+          );
+        }
+      }
+      out += payload + "\n";
+    } catch (e) {}
+  }
+
+  // Format B: classic Dean Edwards (toBase words)
+  var reB =
+    /\}\s*\(\s*'((?:\\'|[^'])*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:\\'|[^'])*)'\s*\.split\s*\(\s*'\|'\s*\)/;
+  m = reB.exec(html);
   if (!m) {
-    m = html.match(
-      /\}\s*\(\s*"((?:\\"|[^"])*)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*"((?:\\"|[^"])*)"\s*\.split\s*\(\s*"\|"\s*\)/
-    );
+    reB =
+      /\}\s*\(\s*"((?:\\"|[^"])*)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*"((?:\\"|[^"])*)"\s*\.split\s*\(\s*"\|"\s*\)/;
+    m = reB.exec(html);
   }
-  if (!m) return "";
-  var payload = m[1]
-    .replace(/\\'/g, "'")
-    .replace(/\\"/g, '"')
-    .replace(/\\\\/g, "\\");
-  var a = parseInt(m[2], 10);
-  var c = parseInt(m[3], 10);
-  var keywords = m[4].split("|");
-  var d = {};
-  while (c--) {
-    if (keywords[c]) d[toBase(c, a)] = keywords[c];
+  if (m) {
+    try {
+      var payload2 = m[1]
+        .replace(/\\'/g, "'")
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, "\\");
+      var a2 = parseInt(m[2], 10);
+      var c2 = parseInt(m[3], 10);
+      var keywords2 = m[4].split("|");
+      var d = {};
+      while (c2--) {
+        if (keywords2[c2]) d[toBase(c2, a2)] = keywords2[c2];
+      }
+      out +=
+        payload2.replace(/\b\w+\b/g, function (w) {
+          return d[w] != null ? d[w] : w;
+        }) + "\n";
+    } catch (e) {}
   }
-  var out = payload.replace(/\b\w+\b/g, function (w) {
-    return d[w] != null ? d[w] : w;
-  });
+
   return out;
 }
 
-function findStreamInText(text) {
+function findStreamInTextfunction findStreamInText(text) {
   if (!text) return null;
   var m3u = text.match(/https?:\/\/[^"'\s\\<>]+\\.m3u8[^"'\s\\<>]*/i);
   if (!m3u) m3u = text.match(/https?:\/\/[^"'\s\\<>]+m3u8[^"'\s\\<>]*/i);
@@ -642,15 +673,30 @@ async function extractFromVoe(embedUrl) {
 
 async function extractFromGeneric(embedUrl) {
   var html = await getSoft(embedUrl, "https://embed69.org/");
-  if (!html) return null;
-  var stream = findStreamInText(html);
-  if (stream) return stream;
+  if (!html || html.length < 400) return null;
+  // unpack first (vidhide/filemoon hide links inside packer)
   var unpacked = unpackPacker(html);
   if (unpacked) {
-    stream = findStreamInText(unpacked);
+    var stream = findStreamInText(unpacked);
     if (stream) return stream;
+    // links.hls / links.hls2 patterns after unpack
+    var hls = unpacked.match(
+      /(?:hls\d*|file)\s*:\s*["'](https?:\/\/[^"']+m3u8[^"']*)["']/i
+    );
+    if (!hls)
+      hls = unpacked.match(
+        /https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/i
+      ) || unpacked.match(/https?:\/\/[^"'\s<>]+m3u8[^"'\s<>]*/i);
+    if (hls) {
+      var u = (hls[1] || hls[0]).replace(/\u0026/g, "&").replace(/\/g, "");
+      return { url: u, mime: "application/x-mpegURL" };
+    }
   }
-  return null;
+  return findStreamInText(html);
+}
+
+async function extractFromVidhide(embedUrl) {
+  return await extractFromGeneric(embedUrl);
 }
 
 async function extractStreamFromEmbed(embed) {
@@ -660,12 +706,15 @@ async function extractStreamFromEmbed(embed) {
     host = url.split("/")[2] || "";
   } catch (e) {}
   var stream = null;
-  if (
-    /streamwish|hglink|swhoi|strwish|wish/i.test(host + embed.serverRaw + embed.server)
-  ) {
+  var tag = (host + " " + (embed.serverRaw || "") + " " + (embed.server || "")).toLowerCase();
+  if (/vidhide|hide|morencius|earnvids|pixeldrain/i.test(tag) || /morencius|vidhide/i.test(url)) {
+    stream = await extractFromVidhide(url);
+  } else if (/streamwish|hglink|swhoi|strwish|wish/i.test(tag) || /hglink|swhoi|strwish|streamwish/i.test(url)) {
     stream = await extractFromStreamwish(url);
-  } else if (/voe/i.test(host + embed.serverRaw + embed.server)) {
+    if (!stream) stream = await extractFromGeneric(url);
+  } else if (/voe/i.test(tag) || /voe\.sx/i.test(url)) {
     stream = await extractFromVoe(url);
+    if (!stream) stream = await extractFromGeneric(url);
   } else {
     stream = await extractFromGeneric(url);
     if (!stream && /wish|hglink|swhoi/i.test(url)) {
@@ -812,12 +861,20 @@ export async function home() {
     { id: "terror", title: "Terror", path: "/generos/terror", genre: "peliculas" },
     { id: "drama", title: "Drama", path: "/generos/drama", genre: "series" },
     { id: "ciencia-ficcion", title: "Ciencia ficción", path: "/generos/ciencia-ficcion", genre: "peliculas" },
+    { id: "romance", title: "Romance", path: "/generos/romance", genre: "series" },
+    { id: "suspense", title: "Suspense", path: "/generos/suspense", genre: "peliculas" },
+    { id: "fantasia", title: "Fantasía", path: "/generos/fantasia", genre: "peliculas" },
+    { id: "animacion", title: "Animación", path: "/generos/animacion", genre: "peliculas" },
+    { id: "crimen", title: "Crimen", path: "/generos/crimen", genre: "series" },
+    { id: "misterio", title: "Misterio", path: "/generos/misterio", genre: "series" },
+    { id: "year-2026", title: "Estrenos 2026", path: "/year/2026", genre: "peliculas" },
+    { id: "year-2025", title: "Del 2025", path: "/year/2025", genre: "peliculas" },
   ];
 
   for (var e = 0; e < extras.length; e++) {
     var ex = extras[e];
     var items = await loadPath(ex.path, 18);
-    if (items.length >= 4) {
+    if (items.length >= 3) {
       rows.push({
         id: ex.id,
         title: ex.title,
