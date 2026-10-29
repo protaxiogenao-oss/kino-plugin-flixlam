@@ -1,10 +1,10 @@
 {
   "id": "flixlatam",
   "name": "FlixLatam",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "apiVersion": 6,
   "entry": "plugin.js",
-  "description": "Hecho por Hotaru Yume - Series, películas y anime en latino",
+  "description": "Hecho por Hotaru Yume. FlixLatam: series, películas y anime en latino",
   "author": "Hotaru Yume",
   "homepage": "https://flixlatam.com",
   "browser": "pages",
@@ -78,11 +78,26 @@
       "type": "select",
       "default": "LAT",
       "options": [
-        { "value": "LAT", "label": "Latino" },
-        { "value": "ESP", "label": "Castellano" },
-        { "value": "SUB", "label": "Subtitulado" },
-        { "value": "ENG", "label": "Inglés" },
-        { "value": "auto", "label": "Automático" }
+        {
+          "value": "LAT",
+          "label": "Latino"
+        },
+        {
+          "value": "ESP",
+          "label": "Castellano"
+        },
+        {
+          "value": "SUB",
+          "label": "Subtitulado"
+        },
+        {
+          "value": "ENG",
+          "label": "Inglés"
+        },
+        {
+          "value": "auto",
+          "label": "Automático"
+        }
       ]
     },
     {
@@ -91,12 +106,30 @@
       "type": "select",
       "default": "streamwish",
       "options": [
-        { "value": "auto", "label": "Automático" },
-        { "value": "streamwish", "label": "Streamwish" },
-        { "value": "voe", "label": "Voe" },
-        { "value": "filemoon", "label": "Filemoon" },
-        { "value": "vidhide", "label": "Vidhide" },
-        { "value": "rapidvideo", "label": "Rapidvideo" }
+        {
+          "value": "auto",
+          "label": "Automático"
+        },
+        {
+          "value": "streamwish",
+          "label": "Streamwish"
+        },
+        {
+          "value": "voe",
+          "label": "Voe"
+        },
+        {
+          "value": "filemoon",
+          "label": "Filemoon"
+        },
+        {
+          "value": "vidhide",
+          "label": "Vidhide"
+        },
+        {
+          "value": "rapidvideo",
+          "label": "Rapidvideo"
+        }
       ]
     }
   ]

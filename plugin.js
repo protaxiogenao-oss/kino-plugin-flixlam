@@ -1,7 +1,7 @@
 /// <reference path="./kino.d.ts" />
 /**
- * FlixLatam plugin for Kino — v1.1.0
- * Series, películas y anime en latino (flixlatam.com)
+ * FlixLatam plugin for Kino — v1.2.0
+ * Hecho por Hotaru Yume. Series, películas y anime en latino (flixlatam.com)
  * Resolve: PoW + AES (Embed69) → Streamwish/Voe/Vidhide → m3u8
  */
 
@@ -670,7 +670,7 @@ export async function search(query) {
   if (page > 1) path += "&page=" + page;
   var html = await get(path);
   var parsed = parsePageItems(html, path);
-  var items = rank(parsed.items, q);
+  var items = rank(parsed.items, q).slice(0, 100); // máximo permitido por Kino
   if (parsed.next) return { items: items, next: parsed.next };
   return items;
 }
@@ -678,13 +678,26 @@ export async function search(query) {
 export async function home() {
   var html = await get("/");
   var rows = [];
+  var seen = {}; // evita títulos repetidos entre filas
+
+  function takeUnique(list, max) {
+    var out = [];
+    for (var i = 0; i < list.length && out.length < max; i++) {
+      var it = list[i];
+      var key = it.ref || it.id;
+      if (seen[key]) continue;
+      seen[key] = true;
+      out.push(it);
+    }
+    return out;
+  }
 
   var latest = parseLatestEpisodes(html);
   if (latest.length) {
     rows.push({
       id: "ultimos-episodios",
       title: "Últimos episodios",
-      items: latest.slice(0, 24),
+      items: takeUnique(latest, 60),
       ref: "/?section=ultimos",
       genre: "series",
     });
@@ -695,15 +708,17 @@ export async function home() {
       new RegExp("<h[12][^>]*>\\s*(?:<[^>]+>\\s*)*" + label, "i")
     );
     if (idx < 0) return [];
-    return parseItems(html.slice(idx, idx + 25000)).slice(0, 24);
+    return parseItems(html.slice(idx, idx + 25000));
   }
 
+  // Películas (recientes de portada o /peliculas)
   var pelis = sectionItems("Películas");
   if (!pelis.length) {
     try {
-      pelis = parseItems(await get("/peliculas")).slice(0, 24);
+      pelis = parseItems(await get("/peliculas"));
     } catch (e) {}
   }
+  pelis = takeUnique(pelis, 60);
   if (pelis.length) {
     rows.push({
       id: "peliculas",
@@ -714,12 +729,14 @@ export async function home() {
     });
   }
 
+  // Series
   var series = sectionItems("Series");
   if (!series.length) {
     try {
-      series = parseItems(await get("/series")).slice(0, 24);
+      series = parseItems(await get("/series"));
     } catch (e) {}
   }
+  series = takeUnique(series, 60);
   if (series.length) {
     rows.push({
       id: "series",
@@ -730,12 +747,14 @@ export async function home() {
     });
   }
 
+  // Anime
   var anime = sectionItems("Anime");
   if (!anime.length) {
     try {
-      anime = parseItems(await get("/animes")).slice(0, 24);
+      anime = parseItems(await get("/animes"));
     } catch (e) {}
   }
+  anime = takeUnique(anime, 60);
   if (anime.length) {
     rows.push({
       id: "anime",
@@ -746,21 +765,62 @@ export async function home() {
     });
   }
 
+  // Populares (páginas dedicadas)
   try {
-    var popItems = parseItems(await get("/series/populares")).slice(0, 24);
-    if (popItems.length) {
+    var popPelis = takeUnique(parseItems(await get("/peliculas/populares")), 60);
+    if (popPelis.length) {
       rows.push({
-        id: "populares",
+        id: "peliculas-populares",
+        title: "Películas populares",
+        items: popPelis,
+        ref: "/peliculas/populares",
+        genre: "peliculas",
+      });
+    }
+  } catch (e) {}
+
+  try {
+    var popSeries = takeUnique(parseItems(await get("/series/populares")), 60);
+    if (popSeries.length) {
+      rows.push({
+        id: "series-populares",
         title: "Series populares",
-        items: popItems,
+        items: popSeries,
         ref: "/series/populares",
         genre: "series",
       });
     }
   } catch (e) {}
 
+  try {
+    var popAnime = takeUnique(parseItems(await get("/animes/populares")), 60);
+    if (popAnime.length) {
+      rows.push({
+        id: "anime-populares",
+        title: "Anime populares",
+        items: popAnime,
+        ref: "/animes/populares",
+        genre: "anime",
+      });
+    }
+  } catch (e) {}
+
+  // Doramas (género)
+  try {
+    var doramas = takeUnique(parseItems(await get("/generos/dorama")), 60);
+    if (doramas.length) {
+      rows.push({
+        id: "doramas",
+        title: "Doramas",
+        items: doramas,
+        ref: "/generos/dorama",
+        genre: "series",
+      });
+    }
+  } catch (e) {}
+
   if (!rows.length) {
-    var any = parseItems(html).slice(0, 24);
+    var any = takeUnique(parseItems(html), 60);
     if (any.length)
       rows.push({ id: "inicio", title: "Inicio", items: any, ref: "/" });
   }
@@ -772,11 +832,16 @@ export async function browse(ref, cursor) {
   if (cursor) path = cursor;
   if (path.indexOf("http") === 0) path = pathFromUrl(path);
   if (path === "/?section=ultimos") {
-    return { items: parseLatestEpisodes(await get("/")), next: null };
+    var ult = parseLatestEpisodes(await get("/")).slice(0, 100);
+    return { items: ult, next: null };
   }
   var html = await get(path);
   var parsed = parsePageItems(html, path);
-  return { items: parsed.items, next: parsed.next || undefined };
+  // máximo 100 ítems por página (límite de Kino)
+  return {
+    items: (parsed.items || []).slice(0, 100),
+    next: parsed.next || undefined,
+  };
 }
 
 export async function episodes(ref) {
