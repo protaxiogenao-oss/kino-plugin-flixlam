@@ -6,6 +6,7 @@
   "entry": "plugin.js",
   "description": "Hecho por Hotaru Yume. FlixLatam: series, películas y anime en latino",
   "author": "Hotaru Yume",
+  "creator": "hotaruyume",
   "homepage": "https://flixlatam.com",
   "browser": "pages",
   "hosts": [
