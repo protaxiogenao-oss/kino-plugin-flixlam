@@ -1,8 +1,9 @@
 /// <reference path="./kino.d.ts" />
 /**
- * FlixLatam plugin for Kino — v1.2.0
+ * FlixLatam plugin for Kino — v1.2.1
  * Hecho por Hotaru Yume. Series, películas y anime en latino (flixlatam.com)
  * Resolve: PoW + AES (Embed69) → Streamwish/Voe/Vidhide → m3u8
+ * v1.2.1: home optimized for Kino's 20s limit (1 primary fetch + ≤3 parallel soft fills)
  */
 
 const BASE = "https://flixlatam.com";
@@ -22,11 +23,12 @@ function hdr(extra) {
   return h;
 }
 
-async function get(path, referer) {
+async function get(path, referer, timeoutMs) {
   var url = path.indexOf("http") === 0 ? path : BASE + path;
   var r = await kino.fetch(url, {
     headers: hdr(referer ? { Referer: referer } : null),
-    timeoutMs: 20000,
+    // Default 12s: home has a hard 20s budget; leave headroom for parse + parallel fills
+    timeoutMs: timeoutMs || 12000,
   });
   if (!r.ok) {
     throw kino.error("unavailable", "http " + r.status, {
@@ -36,11 +38,12 @@ async function get(path, referer) {
   return await r.text();
 }
 
-async function getSoft(url, referer) {
+async function getSoft(url, referer, timeoutMs) {
   try {
-    var r = await kino.fetch(url, {
+    var full = url.indexOf("http") === 0 ? url : BASE + url;
+    var r = await kino.fetch(full, {
       headers: hdr(referer ? { Referer: referer } : null),
-      timeoutMs: 18000,
+      timeoutMs: timeoutMs || 7000,
     });
     if (!r.ok) return "";
     return await r.text();
@@ -676,9 +679,23 @@ export async function search(query) {
 }
 
 export async function home() {
-  var html = await get("/");
+  // Kino hard-limits home to 20s total. Strategy:
+  // 1) One primary fetch of the homepage (≤12s)
+  // 2) Parse every section from that HTML
+  // 3) Only if a main category is missing, soft-fetch ≤3 pages IN PARALLEL (≤7s)
+  // 4) Never sequential multi-page walks (that caused the previous timeouts)
+  // Populares / doramas stay reachable via browse(ref), not loaded in home.
+
+  var html = "";
+  try {
+    html = await get("/", null, 12000);
+  } catch (e) {
+    // Last resort: soft retry with shorter timeout so home never hard-fails empty
+    html = await getSoft("/", null, 8000);
+  }
+
   var rows = [];
-  var seen = {}; // evita títulos repetidos entre filas
+  var seen = {};
 
   function takeUnique(list, max) {
     var out = [];
@@ -692,33 +709,68 @@ export async function home() {
     return out;
   }
 
+  function sectionItems(label) {
+    if (!html) return [];
+    var idx = html.search(
+      new RegExp("<h[12][^>]*>\\s*(?:<[^>]+>\\s*)*" + label, "i")
+    );
+    if (idx < 0) {
+      // also try common variants without accents / alternate headings
+      idx = html.search(
+        new RegExp(
+          "<h[12][^>]*>\\s*(?:<[^>]+>\\s*)*" +
+            label.replace(/[áéíóú]/gi, function (c) {
+              return "[" + c + c.toUpperCase() + "]";
+            }),
+          "i"
+        )
+      );
+    }
+    if (idx < 0) return [];
+    return parseItems(html.slice(idx, idx + 30000));
+  }
+
+  // --- rows from homepage HTML only ---
   var latest = parseLatestEpisodes(html);
   if (latest.length) {
     rows.push({
       id: "ultimos-episodios",
       title: "Últimos episodios",
-      items: takeUnique(latest, 60),
+      items: takeUnique(latest, 40),
       ref: "/?section=ultimos",
       genre: "series",
     });
   }
 
-  function sectionItems(label) {
-    var idx = html.search(
-      new RegExp("<h[12][^>]*>\\s*(?:<[^>]+>\\s*)*" + label, "i")
+  var pelis = sectionItems("Películas");
+  if (!pelis.length) pelis = sectionItems("Peliculas");
+
+  var series = sectionItems("Series");
+  var anime = sectionItems("Anime");
+  if (!anime.length) anime = sectionItems("Animes");
+
+  // Parallel soft-fill only for categories still empty (max 3 concurrent, short timeout)
+  var need = [];
+  if (!pelis.length) need.push({ key: "pelis", path: "/peliculas" });
+  if (!series.length) need.push({ key: "series", path: "/series" });
+  if (!anime.length) need.push({ key: "anime", path: "/animes" });
+
+  if (need.length) {
+    var fills = await Promise.all(
+      need.map(function (n) {
+        return getSoft(n.path, null, 7000).then(function (t) {
+          return { key: n.key, items: t ? parseItems(t) : [] };
+        });
+      })
     );
-    if (idx < 0) return [];
-    return parseItems(html.slice(idx, idx + 25000));
+    for (var f = 0; f < fills.length; f++) {
+      if (fills[f].key === "pelis" && fills[f].items.length) pelis = fills[f].items;
+      if (fills[f].key === "series" && fills[f].items.length) series = fills[f].items;
+      if (fills[f].key === "anime" && fills[f].items.length) anime = fills[f].items;
+    }
   }
 
-  // Películas (recientes de portada o /peliculas)
-  var pelis = sectionItems("Películas");
-  if (!pelis.length) {
-    try {
-      pelis = parseItems(await get("/peliculas"));
-    } catch (e) {}
-  }
-  pelis = takeUnique(pelis, 60);
+  pelis = takeUnique(pelis, 40);
   if (pelis.length) {
     rows.push({
       id: "peliculas",
@@ -729,14 +781,7 @@ export async function home() {
     });
   }
 
-  // Series
-  var series = sectionItems("Series");
-  if (!series.length) {
-    try {
-      series = parseItems(await get("/series"));
-    } catch (e) {}
-  }
-  series = takeUnique(series, 60);
+  series = takeUnique(series, 40);
   if (series.length) {
     rows.push({
       id: "series",
@@ -747,14 +792,7 @@ export async function home() {
     });
   }
 
-  // Anime
-  var anime = sectionItems("Anime");
-  if (!anime.length) {
-    try {
-      anime = parseItems(await get("/animes"));
-    } catch (e) {}
-  }
-  anime = takeUnique(anime, 60);
+  anime = takeUnique(anime, 40);
   if (anime.length) {
     rows.push({
       id: "anime",
@@ -765,65 +803,24 @@ export async function home() {
     });
   }
 
-  // Populares (páginas dedicadas)
-  try {
-    var popPelis = takeUnique(parseItems(await get("/peliculas/populares")), 60);
-    if (popPelis.length) {
-      rows.push({
-        id: "peliculas-populares",
-        title: "Películas populares",
-        items: popPelis,
-        ref: "/peliculas/populares",
-        genre: "peliculas",
-      });
-    }
-  } catch (e) {}
-
-  try {
-    var popSeries = takeUnique(parseItems(await get("/series/populares")), 60);
-    if (popSeries.length) {
-      rows.push({
-        id: "series-populares",
-        title: "Series populares",
-        items: popSeries,
-        ref: "/series/populares",
-        genre: "series",
-      });
-    }
-  } catch (e) {}
-
-  try {
-    var popAnime = takeUnique(parseItems(await get("/animes/populares")), 60);
-    if (popAnime.length) {
-      rows.push({
-        id: "anime-populares",
-        title: "Anime populares",
-        items: popAnime,
-        ref: "/animes/populares",
-        genre: "anime",
-      });
-    }
-  } catch (e) {}
-
-  // Doramas (género)
-  try {
-    var doramas = takeUnique(parseItems(await get("/generos/dorama")), 60);
-    if (doramas.length) {
-      rows.push({
-        id: "doramas",
-        title: "Doramas",
-        items: doramas,
-        ref: "/generos/dorama",
-        genre: "series",
-      });
-    }
-  } catch (e) {}
-
-  if (!rows.length) {
-    var any = takeUnique(parseItems(html), 60);
-    if (any.length)
+  // Fallback: anything parseable from the homepage
+  if (!rows.length && html) {
+    var any = takeUnique(parseItems(html), 40);
+    if (any.length) {
       rows.push({ id: "inicio", title: "Inicio", items: any, ref: "/" });
+    }
   }
+
+  // Absolute last resort so Kino does not show a blank home for this source
+  if (!rows.length) {
+    rows.push({
+      id: "inicio",
+      title: "FlixLatam",
+      items: [],
+      ref: "/peliculas",
+    });
+  }
+
   return rows;
 }
 
