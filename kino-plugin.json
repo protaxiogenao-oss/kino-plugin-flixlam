@@ -4,7 +4,7 @@
   "version": "1.2.0",
   "apiVersion": 6,
   "entry": "plugin.js",
-  "description": "Hecho por Hotaru Yume. FlixLatam: series, películas y anime en latino",
+  "description": "Series, películas y anime en latino, castellano e inglés sub español",
   "author": "Hotaru Yume",
   "creator": "hotaruyume",
   "homepage": "https://flixlatam.com",
