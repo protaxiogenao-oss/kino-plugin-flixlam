@@ -1,8 +1,9 @@
 /// <reference path="./kino.d.ts" />
 /**
- * FlixLatam plugin for Kino — v1.2.3
+ * FlixLatam plugin for Kino — v1.2.4
  * Hecho por Hotaru Yume. Series, películas y anime en latino (flixlatam.com)
  * Resolve: Embed69 AES (LINK_CHALLENGE) → Vidhide (prioridad) / Streamwish / Filemoon
+ * v1.2.4: episodios #sN-eM, pathFromUrl sin hash, home por secciones h2
  * v1.2.3: nuevo cifrado Embed69 (sin PoW), prioriza Vidhide, evita VOE (captcha)
  * v1.2.2: home anti-timeout + cache
  */
@@ -175,11 +176,40 @@ function kindFromUrl(u) {
 
 function pathFromUrl(u) {
   try {
-    var m = String(u).match(/flixlatam\.com(\/[^?#]*)/i);
+    var s = String(u || "");
+    var m = s.match(/flixlatam\.com(\/[^?#]*)/i);
     if (m) return m[1];
-    if (u.charAt(0) === "/") return u.split("?")[0];
+    if (s.charAt(0) === "/") {
+      return s.split("?")[0].split("#")[0];
+    }
+    // bare path without leading slash
+    if (/^(serie|anime|pelicula)\//i.test(s)) {
+      return "/" + s.split("?")[0].split("#")[0];
+    }
   } catch (e) {}
-  return u;
+  return String(u || "").split("?")[0].split("#")[0];
+}
+
+/** Series slug path without season/episode or hash */
+function seriesPathFromHref(href) {
+  var p = pathFromUrl(abs(href));
+  p = p.replace(/\/temporada\/.*$/i, "").replace(/\/$/, "");
+  return p;
+}
+
+/** Parse #s12-e3 or /temporada/12/capitulo/3 → {season, number} */
+function parseEpCoords(href) {
+  var s = String(href || "");
+  var hm = s.match(/#s(\d+)-e(\d+)/i);
+  if (hm) return { season: parseInt(hm[1], 10), number: parseInt(hm[2], 10) };
+  var tm = s.match(/\/temporada\/(\d+)\/capitulo\/(\d+)/i);
+  if (tm) return { season: parseInt(tm[1], 10), number: parseInt(tm[2], 10) };
+  return null;
+}
+
+function episodePagePath(seriesPath, season, number) {
+  var base = seriesPath.replace(/\/$/, "");
+  return base + "/temporada/" + season + "/capitulo/" + number;
 }
 
 function parseItems(html) {
@@ -243,59 +273,61 @@ function parseItems(html) {
 }
 
 function parseLatestEpisodes(html) {
+  // Current site: /serie|anime/slug#s4-e1 (hash). Legacy: /temporada/N/capitulo/M
   var items = [];
   var seen = {};
   var re =
-    /<article[^>]*class="[^"]*item[^"]*"[^>]*>[\s\S]*?<a[^>]+href="([^"]+\/(?:serie|anime)\/[^"]+\/temporada\/\d+\/capitulo\/\d+)"[\s\S]*?<img[^>]+src="([^"]+)"[^>]*(?:alt="([^"]*)")?[\s\S]*?(?:<h3[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>|<div class="data">[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>)/gi;
+    /<article[^>]*class="[^"]*"[^>]*>[\s\S]*?<a[^>]+href="((?:https:\/\/flixlatam\.com)?\/(?:serie|anime)\/[^"#?]+(?:#s\d+-e\d+|\/temporada\/\d+\/capitulo\/\d+)?)"[\s\S]*?<img[^>]+src="([^"]+)"[^>]*(?:alt="([^"]*)")?[\s\S]*?(?:<h3[^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>|<div class="data">[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>)/gi;
   var m;
   while ((m = re.exec(html)) !== null) {
-    var href = abs(m[1]);
-    var path = pathFromUrl(href);
-    if (seen[path]) continue;
-    seen[path] = true;
+    var href = m[1];
+    var coords = parseEpCoords(href);
+    var seriesPath = seriesPathFromHref(href);
+    if (!seriesPath || !/\/(serie|anime)\//i.test(seriesPath)) continue;
+    var key = seriesPath + (coords ? ":" + coords.season + "x" + coords.number : "");
+    if (seen[key]) continue;
+    seen[key] = true;
     var poster = abs(m[2]);
     var alt = strip(m[3] || "");
     var title = strip(m[4] || m[5] || alt);
-    var badge = "";
-    var bm = path.match(/\/temporada\/(\d+)\/capitulo\/(\d+)/i);
-    if (bm) badge = "T" + bm[1] + "E" + bm[2];
+    var badge = coords ? "T" + coords.season + "E" + coords.number : "";
     if (title && badge && title.indexOf(badge) < 0 && !/T\d+/.test(title)) {
       title = title + " — " + badge;
     }
-    if (!title) title = alt || path;
-    var seriesPath = path.replace(/\/temporada\/.*$/i, "");
+    if (!title) title = alt || seriesPath;
     items.push({
-      id: makeId(path.replace(/^\//, "").replace(/\//g, "-")),
+      id: makeId((seriesPath + (badge || "")).replace(/^\//, "").replace(/\//g, "-")),
       ref: seriesPath,
       title: title,
       kind: "series",
       poster: poster,
       backdrop: poster,
       badges: badge ? [badge] : undefined,
-      genres: /\/anime\//i.test(path) ? ["anime"] : ["series"],
+      genres: /\/anime\//i.test(seriesPath) ? ["anime"] : ["series"],
     });
   }
   if (items.length === 0) {
+    // Fallback: any episode-looking href near an image
     var re2 =
-      /href="([^"]+\/(?:serie|anime)\/[^"]+\/temporada\/(\d+)\/capitulo\/(\d+))"[^>]*>[\s\S]{0,500}?<img[^>]+src="([^"]+)"[^>]*(?:alt="([^"]*)")?/gi;
+      /href="((?:https:\/\/flixlatam\.com)?\/(?:serie|anime)\/[^"]+#s(\d+)-e(\d+))"[^>]*>[\s\S]{0,600}?<img[^>]+src="([^"]+)"[^>]*(?:alt="([^"]*)")?/gi;
     while ((m = re2.exec(html)) !== null) {
-      var href2 = abs(m[1]);
-      var path2 = pathFromUrl(href2);
-      if (seen[path2]) continue;
-      seen[path2] = true;
-      var series2 = path2.replace(/\/temporada\/.*$/i, "");
+      var series2 = seriesPathFromHref(m[1]);
       var badge2 = "T" + m[2] + "E" + m[3];
+      var key2 = series2 + ":" + m[2] + "x" + m[3];
+      if (seen[key2]) continue;
+      seen[key2] = true;
       var title2 = strip(m[5] || "");
       if (title2 && title2.indexOf(badge2) < 0) title2 = title2 + " — " + badge2;
       if (!title2) title2 = badge2;
       items.push({
-        id: makeId(path2.replace(/^\//, "").replace(/\//g, "-")),
+        id: makeId((series2 + badge2).replace(/^\//, "").replace(/\//g, "-")),
         ref: series2,
         title: title2,
         kind: "series",
         poster: abs(m[4]),
         backdrop: abs(m[4]),
         badges: [badge2],
+        genres: /\/anime\//i.test(series2) ? ["anime"] : ["series"],
       });
     }
   }
@@ -878,7 +910,7 @@ export async function home() {
   // Plan: storage cache → one short fetch → optional browser.page → parse → return.
   // NEVER throw from home (throws become timeouts / disable the plugin).
 
-  var CACHE_KEY = "home_html_v2";
+  var CACHE_KEY = "home_html_v3";
   var CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
   var rows = [];
   var seen = {};
@@ -896,19 +928,47 @@ export async function home() {
     return out;
   }
 
-  function sectionItems(label) {
-    if (!html) return [];
-    var idx = html.search(
-      new RegExp("<h[12][^>]*>\\s*(?:<[^>]+>\\s*)*" + label, "i")
+  /** Slice HTML from matching h2 until the next h2 (avoids mixing sections). */
+  function sectionSlice(label) {
+    if (!html) return "";
+    // Label must sit inside the same <h2>...</h2> (icons allowed before text)
+    var re = new RegExp(
+      "<h2\\b[^>]*>(?:(?!<\\/h2>)[\\s\\S])*?" + label + "(?:(?!<\\/h2>)[\\s\\S])*?<\\/h2>",
+      "i"
     );
-    if (idx < 0) return [];
-    return parseItems(html.slice(idx, idx + 30000));
+    var m = re.exec(html);
+    if (!m) return "";
+    var start = m.index;
+    var afterHeader = start + m[0].length;
+    var rest = html.slice(afterHeader);
+    var next = rest.search(/<h2\b/i);
+    return next >= 0 ? html.slice(start, afterHeader + next) : html.slice(start);
+  }
+
+  function sectionItems(label, kindFilter) {
+    var chunk = sectionSlice(label);
+    if (!chunk) return [];
+    var list = parseItems(chunk);
+    if (!kindFilter) return list;
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var it = list[i];
+      var ref = it.ref || "";
+      if (kindFilter === "movie" && /\/pelicula\//i.test(ref)) out.push(it);
+      else if (kindFilter === "anime" && /\/anime\//i.test(ref)) out.push(it);
+      else if (kindFilter === "series" && /\/serie\//i.test(ref)) out.push(it);
+    }
+    return out;
   }
 
   function buildRows() {
     var out = [];
     seen = {};
-    var latest = parseLatestEpisodes(html);
+    // Últimos episodios: only that h2 block (not the whole page)
+    var latestChunk = sectionSlice("ltimos Episodios");
+    if (!latestChunk) latestChunk = sectionSlice("Últimos Episodios");
+    if (!latestChunk) latestChunk = sectionSlice("Ultimos Episodios");
+    var latest = parseLatestEpisodes(latestChunk || "");
     if (latest.length) {
       out.push({
         id: "ultimos-episodios",
@@ -918,8 +978,8 @@ export async function home() {
         genre: "series",
       });
     }
-    var pelis = sectionItems("Películas");
-    if (!pelis.length) pelis = sectionItems("Peliculas");
+    var pelis = sectionItems("Películas", "movie");
+    if (!pelis.length) pelis = sectionItems("Peliculas", "movie");
     pelis = takeUnique(pelis, 40);
     if (pelis.length) {
       out.push({
@@ -930,7 +990,7 @@ export async function home() {
         genre: "peliculas",
       });
     }
-    var series = takeUnique(sectionItems("Series"), 40);
+    var series = takeUnique(sectionItems("Series", "series"), 40);
     if (series.length) {
       out.push({
         id: "series",
@@ -940,8 +1000,8 @@ export async function home() {
         genre: "series",
       });
     }
-    var anime = sectionItems("Anime");
-    if (!anime.length) anime = sectionItems("Animes");
+    var anime = sectionItems("Anime", "anime");
+    if (!anime.length) anime = sectionItems("Animes", "anime");
     anime = takeUnique(anime, 40);
     if (anime.length) {
       out.push({
@@ -950,6 +1010,16 @@ export async function home() {
         items: anime,
         ref: "/animes",
         genre: "anime",
+      });
+    }
+    var doramas = takeUnique(sectionItems("Doramas", "series"), 40);
+    if (doramas.length) {
+      out.push({
+        id: "doramas",
+        title: "Doramas",
+        items: doramas,
+        ref: "/generos/dorama",
+        genre: "series",
       });
     }
     if (!out.length) {
@@ -1051,9 +1121,30 @@ export async function browse(ref, cursor) {
 
 export async function episodes(ref) {
   var path = ref;
+  if (String(path).indexOf("ep:") === 0) path = String(path).slice(3);
   if (path.indexOf("http") === 0) path = pathFromUrl(path);
   path = path.replace(/\/temporada\/.*$/i, "").replace(/\/$/, "");
-  var html = await get(path);
+  path = path.split("#")[0];
+
+  var html = "";
+  try {
+    html = await readPage(path, {
+      fetchMs: 10000,
+      browserMs: 10000,
+      waitFor: "episodios",
+    });
+  } catch (e) {
+    try {
+      html = await get(path);
+    } catch (e2) {
+      html = "";
+    }
+  }
+  if (!html) {
+    throw kino.error("unavailable", "series page failed", {
+      userMessage: "No se pudo cargar la lista de episodios.",
+    });
+  }
 
   var title = "";
   var tm = html.match(/<title>([^<]+)/i);
@@ -1062,36 +1153,77 @@ export async function episodes(ref) {
       .replace(/\s*-\s*FLIXLATAM.*$/i, "")
       .replace(/^Ver\s+/i, "")
       .replace(/\s+Online.*$/i, "")
+      .replace(/&#39;/g, "'")
       .trim();
   }
   var poster = "";
   var pm = html.match(
     /class="poster"[\s\S]{0,400}?<img[^>]+src="([^"]+)"/i
   );
+  if (!pm) pm = html.match(/property="og:image"\s+content="([^"]+)"/i);
   if (pm) poster = abs(pm[1]);
   var overview = "";
   var om = html.match(/class="wp-content"[^>]*>([\s\S]*?)<\/div>/i);
+  if (!om) om = html.match(/property="og:description"\s+content="([^"]+)"/i);
   if (om) overview = strip(om[1]).slice(0, 600);
 
   var eps = [];
   var seen = {};
-  var re =
-    /href="((?:https:\/\/flixlatam\.com)?(\/(?:serie|anime)\/[^"]+\/temporada\/(\d+)\/capitulo\/(\d+)))"/gi;
-  var m;
-  while ((m = re.exec(html)) !== null) {
-    var full = pathFromUrl(abs(m[1]));
-    var season = parseInt(m[3], 10);
-    var number = parseInt(m[4], 10);
+
+  function addEp(season, number, epTitle) {
+    if (!season || !number || season < 1 || number < 1) return;
     var key = season + "x" + number;
-    if (seen[key]) continue;
+    if (seen[key]) return;
     seen[key] = true;
+    var full = episodePagePath(path, season, number);
     eps.push({
       season: season,
       number: number,
       ref: "ep:" + full,
-      title: "T" + season + "E" + number,
+      title: epTitle || "T" + season + "E" + number,
     });
   }
+
+  // 1) Hash links: /anime/slug#s1-e2  or episode-link class
+  var reHash =
+    /href="((?:https:\/\/flixlatam\.com)?\/(?:serie|anime)\/[^"#?]+#s(\d+)-e(\d+))"[^>]*>([\s\S]*?)<\/a>/gi;
+  var m;
+  while ((m = reHash.exec(html)) !== null) {
+    var epTitle = strip(m[4]).replace(/\s+/g, " ");
+    if (!epTitle || epTitle.length > 80) epTitle = "Episodio " + m[3];
+    addEp(parseInt(m[2], 10), parseInt(m[3], 10), epTitle);
+  }
+
+  // 2) numerando "1 - 2" blocks next to episode-link
+  var reNum =
+    /class="numerando"[^>]*>\s*(\d+)\s*[-–]\s*(\d+)\s*<\/div>[\s\S]{0,200}?class="episodiotitle"[^>]*>\s*<a[^>]*>([\s\S]*?)<\/a>/gi;
+  while ((m = reNum.exec(html)) !== null) {
+    addEp(parseInt(m[1], 10), parseInt(m[2], 10), strip(m[3]) || undefined);
+  }
+
+  // 3) Legacy full paths /temporada/N/capitulo/M
+  var reLeg =
+    /href="((?:https:\/\/flixlatam\.com)?(\/(?:serie|anime)\/[^"]+\/temporada\/(\d+)\/capitulo\/(\d+)))"/gi;
+  while ((m = reLeg.exec(html)) !== null) {
+    addEp(parseInt(m[3], 10), parseInt(m[4], 10), "T" + m[3] + "E" + m[4]);
+  }
+
+  // 4) data-season panels: count episode-link inside each season
+  if (eps.length === 0) {
+    var rePanel =
+      /data-season="(\d+)"[\s\S]*?<ul class="episodios"[^>]*>([\s\S]*?)<\/ul>/gi;
+    while ((m = rePanel.exec(html)) !== null) {
+      var season = parseInt(m[1], 10);
+      var lis = m[2].match(/<li[\s\S]*?<\/li>/gi) || [];
+      for (var i = 0; i < lis.length; i++) {
+        var nm = lis[i].match(/class="numerando"[^>]*>\s*\d+\s*[-–]\s*(\d+)/i);
+        var number = nm ? parseInt(nm[1], 10) : i + 1;
+        var tm2 = lis[i].match(/<a[^>]*class="[^"]*episode-link[^"]*"[^>]*>([\s\S]*?)<\/a>/i);
+        addEp(season, number, tm2 ? strip(tm2[1]) : "Episodio " + number);
+      }
+    }
+  }
+
   eps.sort(function (a, b) {
     if (a.season !== b.season) return a.season - b.season;
     return a.number - b.number;
@@ -1109,6 +1241,12 @@ export async function episodes(ref) {
         },
       ],
     };
+  }
+
+  if (eps.length === 0) {
+    throw kino.error("not_found", "no episodes parsed", {
+      userMessage: "No hay episodios disponibles por ahora.",
+    });
   }
 
   return {
