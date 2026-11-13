@@ -1,9 +1,10 @@
 /// <reference path="./kino.d.ts" />
 /**
- * FlixLatam plugin for Kino — v1.2.1
+ * FlixLatam plugin for Kino — v1.2.3
  * Hecho por Hotaru Yume. Series, películas y anime en latino (flixlatam.com)
- * Resolve: PoW + AES (Embed69) → Streamwish/Voe/Vidhide → m3u8
- * v1.2.1: home optimized for Kino's 20s limit (1 primary fetch + ≤3 parallel soft fills)
+ * Resolve: Embed69 AES (LINK_CHALLENGE) → Vidhide (prioridad) / Streamwish / Filemoon
+ * v1.2.3: nuevo cifrado Embed69 (sin PoW), prioriza Vidhide, evita VOE (captcha)
+ * v1.2.2: home anti-timeout + cache
  */
 
 const BASE = "https://flixlatam.com";
@@ -23,19 +24,32 @@ function hdr(extra) {
   return h;
 }
 
+function isChallengeOrEmpty(html) {
+  if (!html || html.length < 400) return true;
+  // Cloudflare interstitial / origin errors / empty shells
+  if (/just a moment|cf-chl|attention required|error code:\s*50[123]|502 bad gateway|503 service|origin is unreachable/i.test(html))
+    return true;
+  return false;
+}
+
 async function get(path, referer, timeoutMs) {
   var url = path.indexOf("http") === 0 ? path : BASE + path;
   var r = await kino.fetch(url, {
     headers: hdr(referer ? { Referer: referer } : null),
-    // Default 12s: home has a hard 20s budget; leave headroom for parse + parallel fills
-    timeoutMs: timeoutMs || 12000,
+    timeoutMs: timeoutMs || 10000,
   });
   if (!r.ok) {
     throw kino.error("unavailable", "http " + r.status, {
       userMessage: "No se pudo cargar la página (" + r.status + ").",
     });
   }
-  return await r.text();
+  var text = await r.text();
+  if (isChallengeOrEmpty(text)) {
+    throw kino.error("unavailable", "challenge_or_empty", {
+      userMessage: "El sitio no respondió contenido usable.",
+    });
+  }
+  return text;
 }
 
 async function getSoft(url, referer, timeoutMs) {
@@ -43,13 +57,41 @@ async function getSoft(url, referer, timeoutMs) {
     var full = url.indexOf("http") === 0 ? url : BASE + url;
     var r = await kino.fetch(full, {
       headers: hdr(referer ? { Referer: referer } : null),
-      timeoutMs: timeoutMs || 7000,
+      timeoutMs: timeoutMs || 6000,
     });
     if (!r.ok) return "";
-    return await r.text();
+    var text = await r.text();
+    if (isChallengeOrEmpty(text)) return "";
+    return text;
   } catch (e) {
     return "";
   }
+}
+
+/** Read HTML for listings: cheap fetch first, then optional hidden browser (CF / 502). */
+async function readPage(path, opts) {
+  opts = opts || {};
+  var timeoutFetch = opts.fetchMs || 8000;
+  var timeoutBrowser = opts.browserMs || 10000;
+  var waitFor = opts.waitFor || "article";
+  var url = path.indexOf("http") === 0 ? path : BASE + path;
+
+  var html = await getSoft(url, null, timeoutFetch);
+  if (html && !isChallengeOrEmpty(html)) return html;
+
+  // Origin often 502 / CF challenge — try real browser page (manifest has browser: "pages")
+  try {
+    if (kino.browser && typeof kino.browser.page === "function") {
+      var page = await kino.browser.page(url, {
+        waitFor: waitFor,
+        timeoutMs: timeoutBrowser,
+      });
+      if (page && page.html && !isChallengeOrEmpty(page.html)) return page.html;
+    }
+  } catch (e) {
+    // blocked / busy / browser_unavailable / timeout → fall through
+  }
+  return "";
 }
 
 function strip(s) {
@@ -361,11 +403,13 @@ function preferScore(label, preferLang, preferServer) {
     if (/latino/.test(lab)) s += 50;
     if (/castellano/.test(lab)) s += 40;
   }
-  if (S !== "auto" && lab.indexOf(S) >= 0) s += 40;
-  if (/streamwish/.test(lab)) s += 8;
-  if (/voe/.test(lab)) s += 6;
-  if (/filemoon/.test(lab)) s += 4;
-  if (/vidhide/.test(lab)) s += 2;
+  if (S !== "auto" && lab.indexOf(S) >= 0) s += 80;
+  // Vidhide first (no captcha, packer → m3u8). VOE last (often captcha).
+  if (/vidhide|morencius|earnvids/.test(lab)) s += 30;
+  if (/streamwish|hglink|swhoi|strwish/.test(lab)) s += 18;
+  if (/filemoon|moon/.test(lab)) s += 12;
+  if (/rapid/.test(lab)) s += 6;
+  if (/voe/.test(lab)) s -= 20;
   return s;
 }
 
@@ -445,12 +489,24 @@ function parsePoW(html) {
   };
 }
 
+/** New Embed69 scheme (2025+): SHA256(LINK_CHALLENGE + LINK_SALT) as AES key */
+function parseLinkKey(html) {
+  var ch = html.match(/LINK_CHALLENGE\s*=\s*['"]([^'"]+)['"]/);
+  var sa = html.match(/LINK_SALT\s*=\s*['"]([^'"]+)['"]/);
+  if (!ch || !sa) return null;
+  return kino.crypto.hash("sha256", ch[1] + sa[1]);
+}
+
 /** Decrypt all embeds from an embed69/vidurl page */
 function decryptEmbed69Page(html) {
-  var pow = parsePoW(html);
   var data = parseDataLink(html);
-  if (!pow || !data.length) return [];
-  var keyHex = solvePoW(pow.challenge, pow.difficulty, pow.salt);
+  if (!data.length) return [];
+  var keyHex = parseLinkKey(html);
+  if (!keyHex) {
+    // legacy PoW (older player pages)
+    var pow = parsePoW(html);
+    if (pow) keyHex = solvePoW(pow.challenge, pow.difficulty, pow.salt);
+  }
   if (!keyHex) return [];
   var out = [];
   for (var i = 0; i < data.length; i++) {
@@ -460,11 +516,14 @@ function decryptEmbed69Page(html) {
     for (var j = 0; j < embeds.length; j++) {
       var e = embeds[j];
       var url = decryptLink(e.link, keyHex);
+      if (url) {
+        url = String(url).replace(/`/g, "").trim();
+      }
       if (url && url.indexOf("http") === 0) {
         out.push({
           lang: lang,
-          server: serverLabel(e.servername),
-          serverRaw: e.servername,
+          server: serverLabel(e.servername || url),
+          serverRaw: e.servername || "",
           url: url,
         });
       }
@@ -571,11 +630,12 @@ async function extractFromStreamwish(embedUrl) {
 }
 
 async function extractFromVoe(embedUrl) {
+  // VOE often shows a captcha in real browsers; still try plain extraction.
   var html = await getSoft(embedUrl, "https://embed69.org/");
   if (!html) return null;
+  if (/captcha|turnstile|cf-challenge|just a moment/i.test(html)) return null;
   var stream = findStreamInText(html);
   if (stream) return stream;
-  // voe often stores obfuscated source
   var m = html.match(
     /(?:var|let|const)\s+\w+\s*=\s*['"]([A-Za-z0-9+/=]{40,})['"]/
   );
@@ -586,13 +646,107 @@ async function extractFromVoe(embedUrl) {
       if (stream) return stream;
     } catch (e) {}
   }
-  // prompt('...') pattern
   var p = html.match(/prompt\s*\(\s*['"]([A-Za-z0-9+/=]+)['"]/);
   if (p) {
     try {
       stream = findStreamInText(atob(p[1]));
       if (stream) return stream;
     } catch (e) {}
+  }
+  // application/json encoded blob used by some VOE mirrors
+  var j = html.match(
+    /<script[^>]*type=["']application\/json["'][^>]*>\s*\["([^"]+)"\]/i
+  );
+  if (j) {
+    try {
+      stream = findStreamInText(atob(j[1]));
+      if (stream) return stream;
+    } catch (e) {}
+  }
+  return null;
+}
+
+async function extractFromVidhide(embedUrl) {
+  // Normalize /d/ /f/ /file/ → /v/ or keep /embed/
+  var url = String(embedUrl || "");
+  var candidates = [url];
+  var idM = url.match(
+    /\/(?:embed|e|v|f|d|file|download)\/([A-Za-z0-9]+)/i
+  );
+  var id = idM ? idM[1] : null;
+  if (id) {
+    var hosts = [
+      "morencius.com",
+      "vidhidevip.com",
+      "vidhidepre.com",
+      "vidhidepro.com",
+      "smoothpre.com",
+      "dhtpre.com",
+    ];
+    for (var h = 0; h < hosts.length; h++) {
+      candidates.push("https://" + hosts[h] + "/embed/" + id);
+      candidates.push("https://" + hosts[h] + "/v/" + id);
+      candidates.push("https://" + hosts[h] + "/e/" + id);
+    }
+  }
+  // de-dupe
+  var seen = {};
+  var list = [];
+  for (var c = 0; c < candidates.length; c++) {
+    if (!seen[candidates[c]]) {
+      seen[candidates[c]] = true;
+      list.push(candidates[c]);
+    }
+  }
+  for (var i = 0; i < Math.min(list.length, 5); i++) {
+    var html = await getSoft(list[i], "https://embed69.org/");
+    if (!html || html.length < 400) continue;
+    var stream = findStreamInText(html);
+    if (stream) {
+      stream.headers = {
+        Referer: list[i],
+        "User-Agent": UA,
+        Origin: "https://" + (list[i].split("/")[2] || "vidhidevip.com"),
+      };
+      return stream;
+    }
+    var unpacked = unpackPacker(html);
+    if (unpacked) {
+      // prefer links.hls2 / hls4 absolute URLs
+      var hls = unpacked.match(
+        /["']hls[24]?["']\s*:\s*["'](https?:\/\/[^"']+m3u8[^"']*)["']/i
+      );
+      if (!hls) {
+        hls = unpacked.match(
+          /["']hls[24]?["']\s*:\s*["'](\/[^"']+m3u8[^"']*)["']/i
+        );
+      }
+      if (hls) {
+        var hu = hls[1];
+        if (hu.charAt(0) === "/") {
+          try {
+            hu = "https://" + list[i].split("/")[2] + hu;
+          } catch (e) {}
+        }
+        return {
+          url: hu.replace(/\\u0026/g, "&"),
+          mime: "application/x-mpegURL",
+          headers: {
+            Referer: list[i],
+            "User-Agent": UA,
+            Origin: "https://" + (list[i].split("/")[2] || "vidhidevip.com"),
+          },
+        };
+      }
+      stream = findStreamInText(unpacked);
+      if (stream) {
+        stream.headers = {
+          Referer: list[i],
+          "User-Agent": UA,
+        };
+        return stream;
+      }
+    }
   }
   return null;
 }
@@ -616,25 +770,35 @@ async function extractStreamFromEmbed(embed) {
   try {
     host = url.split("/")[2] || "";
   } catch (e) {}
+  var tag = (host + " " + (embed.serverRaw || "") + " " + (embed.server || "")).toLowerCase();
   var stream = null;
-  if (
-    /streamwish|hglink|swhoi|strwish|wish/i.test(host + embed.serverRaw + embed.server)
-  ) {
+
+  if (/vidhide|morencius|earnvids|smoothpre|dhtpre|peytone/i.test(tag)) {
+    stream = await extractFromVidhide(url);
+  } else if (/streamwish|hglink|swhoi|strwish|wish/i.test(tag)) {
     stream = await extractFromStreamwish(url);
-  } else if (/voe/i.test(host + embed.serverRaw + embed.server)) {
+  } else if (/voe/i.test(tag)) {
+    // VOE is often captcha-gated — only try if user preferred it
     stream = await extractFromVoe(url);
+  } else if (/filemoon|moon/i.test(tag)) {
+    stream = await extractFromGeneric(url);
   } else {
     stream = await extractFromGeneric(url);
     if (!stream && /wish|hglink|swhoi/i.test(url)) {
       stream = await extractFromStreamwish(url);
     }
+    if (!stream && /vidhide|morencius|embed\//i.test(url)) {
+      stream = await extractFromVidhide(url);
+    }
   }
-  if (stream) {
-    stream.label = embed.lang + " · " + embed.server;
-    stream.headers = {
-      Referer: url,
-      "User-Agent": UA,
-    };
+  if (stream && stream.url) {
+    stream.label = (embed.lang || "Audio") + " · " + (embed.server || serverLabel(url));
+    if (!stream.headers) {
+      stream.headers = {
+        Referer: url,
+        "User-Agent": UA,
+      };
+    }
   }
   return stream;
 }
@@ -642,20 +806,44 @@ async function extractStreamFromEmbed(embed) {
 /** From a vidurl/embed69 player page → list of playable streams */
 async function resolvePlayerPage(playerUrl) {
   var html = await getSoft(playerUrl, BASE + "/");
+  if (!html) {
+    // CF / empty: try hidden browser once
+    try {
+      if (kino.browser && typeof kino.browser.page === "function") {
+        var page = await kino.browser.page(playerUrl, {
+          waitFor: "dataLink",
+          timeoutMs: 12000,
+        });
+        if (page && page.html) html = page.html;
+      }
+    } catch (e) {}
+  }
   if (!html) return [];
   var embeds = decryptEmbed69Page(html);
-  // also if page is already an intermediate without POW (rare)
   if (!embeds.length) {
     var direct = findStreamInText(html);
     if (direct) return [direct];
+    return [];
   }
+
+  // Prefer Vidhide / Streamwish; push VOE to the end (captcha)
+  embeds.sort(function (a, b) {
+    return preferScore(b.lang + " · " + b.server, "auto", "vidhide") -
+      preferScore(a.lang + " · " + a.server, "auto", "vidhide");
+  });
+
   var streams = [];
-  // limit to avoid blowing request budget (60 max)
-  var max = Math.min(embeds.length, 6);
+  var max = Math.min(embeds.length, 8);
   for (var i = 0; i < max; i++) {
+    // Skip VOE unless we still have nothing after trying better servers
+    if (/voe/i.test(embeds[i].server + embeds[i].serverRaw + embeds[i].url) && streams.length > 0) {
+      continue;
+    }
     try {
       var s = await extractStreamFromEmbed(embeds[i]);
       if (s && s.url) streams.push(s);
+      // Stop early when we already have a solid non-VOE stream
+      if (streams.length >= 2 && !/voe/i.test(streams[0].label || "")) break;
     } catch (e) {}
   }
   return streams;
@@ -671,31 +859,30 @@ export async function search(query) {
   }
   var path = "/search?s=" + encodeURIComponent(String(q).trim());
   if (page > 1) path += "&page=" + page;
-  var html = await get(path);
+  var html = "";
+  try {
+    html = await readPage(path, { fetchMs: 8000, browserMs: 6000, waitFor: "article" });
+  } catch (e) {
+    return [];
+  }
+  if (!html) return [];
   var parsed = parsePageItems(html, path);
-  var items = rank(parsed.items, q).slice(0, 100); // máximo permitido por Kino
+  var items = rank(parsed.items, q).slice(0, 100);
   if (parsed.next) return { items: items, next: parsed.next };
   return items;
 }
 
 export async function home() {
-  // Kino hard-limits home to 20s total. Strategy:
-  // 1) One primary fetch of the homepage (≤12s)
-  // 2) Parse every section from that HTML
-  // 3) Only if a main category is missing, soft-fetch ≤3 pages IN PARALLEL (≤7s)
-  // 4) Never sequential multi-page walks (that caused the previous timeouts)
-  // Populares / doramas stay reachable via browse(ref), not loaded in home.
+  // Hard limit: 20s. Never chain long waits (12s+8s was still timing out).
+  // Site origin behind Cloudflare often returns 502 or hangs.
+  // Plan: storage cache → one short fetch → optional browser.page → parse → return.
+  // NEVER throw from home (throws become timeouts / disable the plugin).
 
-  var html = "";
-  try {
-    html = await get("/", null, 12000);
-  } catch (e) {
-    // Last resort: soft retry with shorter timeout so home never hard-fails empty
-    html = await getSoft("/", null, 8000);
-  }
-
+  var CACHE_KEY = "home_html_v2";
+  var CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
   var rows = [];
   var seen = {};
+  var html = "";
 
   function takeUnique(list, max) {
     var out = [];
@@ -714,127 +901,148 @@ export async function home() {
     var idx = html.search(
       new RegExp("<h[12][^>]*>\\s*(?:<[^>]+>\\s*)*" + label, "i")
     );
-    if (idx < 0) {
-      // also try common variants without accents / alternate headings
-      idx = html.search(
-        new RegExp(
-          "<h[12][^>]*>\\s*(?:<[^>]+>\\s*)*" +
-            label.replace(/[áéíóú]/gi, function (c) {
-              return "[" + c + c.toUpperCase() + "]";
-            }),
-          "i"
-        )
-      );
-    }
     if (idx < 0) return [];
     return parseItems(html.slice(idx, idx + 30000));
   }
 
-  // --- rows from homepage HTML only ---
-  var latest = parseLatestEpisodes(html);
-  if (latest.length) {
-    rows.push({
-      id: "ultimos-episodios",
-      title: "Últimos episodios",
-      items: takeUnique(latest, 40),
-      ref: "/?section=ultimos",
-      genre: "series",
-    });
-  }
-
-  var pelis = sectionItems("Películas");
-  if (!pelis.length) pelis = sectionItems("Peliculas");
-
-  var series = sectionItems("Series");
-  var anime = sectionItems("Anime");
-  if (!anime.length) anime = sectionItems("Animes");
-
-  // Parallel soft-fill only for categories still empty (max 3 concurrent, short timeout)
-  var need = [];
-  if (!pelis.length) need.push({ key: "pelis", path: "/peliculas" });
-  if (!series.length) need.push({ key: "series", path: "/series" });
-  if (!anime.length) need.push({ key: "anime", path: "/animes" });
-
-  if (need.length) {
-    var fills = await Promise.all(
-      need.map(function (n) {
-        return getSoft(n.path, null, 7000).then(function (t) {
-          return { key: n.key, items: t ? parseItems(t) : [] };
-        });
-      })
-    );
-    for (var f = 0; f < fills.length; f++) {
-      if (fills[f].key === "pelis" && fills[f].items.length) pelis = fills[f].items;
-      if (fills[f].key === "series" && fills[f].items.length) series = fills[f].items;
-      if (fills[f].key === "anime" && fills[f].items.length) anime = fills[f].items;
+  function buildRows() {
+    var out = [];
+    seen = {};
+    var latest = parseLatestEpisodes(html);
+    if (latest.length) {
+      out.push({
+        id: "ultimos-episodios",
+        title: "Últimos episodios",
+        items: takeUnique(latest, 40),
+        ref: "/?section=ultimos",
+        genre: "series",
+      });
     }
-  }
-
-  pelis = takeUnique(pelis, 40);
-  if (pelis.length) {
-    rows.push({
-      id: "peliculas",
-      title: "Películas",
-      items: pelis,
-      ref: "/peliculas",
-      genre: "peliculas",
-    });
-  }
-
-  series = takeUnique(series, 40);
-  if (series.length) {
-    rows.push({
-      id: "series",
-      title: "Series",
-      items: series,
-      ref: "/series",
-      genre: "series",
-    });
-  }
-
-  anime = takeUnique(anime, 40);
-  if (anime.length) {
-    rows.push({
-      id: "anime",
-      title: "Anime",
-      items: anime,
-      ref: "/animes",
-      genre: "anime",
-    });
-  }
-
-  // Fallback: anything parseable from the homepage
-  if (!rows.length && html) {
-    var any = takeUnique(parseItems(html), 40);
-    if (any.length) {
-      rows.push({ id: "inicio", title: "Inicio", items: any, ref: "/" });
+    var pelis = sectionItems("Películas");
+    if (!pelis.length) pelis = sectionItems("Peliculas");
+    pelis = takeUnique(pelis, 40);
+    if (pelis.length) {
+      out.push({
+        id: "peliculas",
+        title: "Películas",
+        items: pelis,
+        ref: "/peliculas",
+        genre: "peliculas",
+      });
     }
+    var series = takeUnique(sectionItems("Series"), 40);
+    if (series.length) {
+      out.push({
+        id: "series",
+        title: "Series",
+        items: series,
+        ref: "/series",
+        genre: "series",
+      });
+    }
+    var anime = sectionItems("Anime");
+    if (!anime.length) anime = sectionItems("Animes");
+    anime = takeUnique(anime, 40);
+    if (anime.length) {
+      out.push({
+        id: "anime",
+        title: "Anime",
+        items: anime,
+        ref: "/animes",
+        genre: "anime",
+      });
+    }
+    if (!out.length) {
+      var any = takeUnique(parseItems(html), 40);
+      if (any.length) {
+        out.push({ id: "inicio", title: "Inicio", items: any, ref: "/" });
+      }
+    }
+    return out;
   }
 
-  // Absolute last resort so Kino does not show a blank home for this source
-  if (!rows.length) {
-    rows.push({
+  // 1) Fresh cache (instant — survives intermittent 502)
+  // kino.storage is sync; values are strings
+  try {
+    var raw = kino.storage.get(CACHE_KEY);
+    if (raw) {
+      var cached = JSON.parse(raw);
+      if (cached && cached.html && cached.ts && Date.now() - cached.ts < CACHE_TTL_MS) {
+        html = cached.html;
+        rows = buildRows();
+        if (rows.length) return rows;
+      }
+    }
+  } catch (e) {}
+
+  // 2) One network path only: short fetch, then browser if needed (budget < 18s)
+  try {
+    html = await readPage("/", {
+      fetchMs: 7000,
+      browserMs: 10000,
+      waitFor: "article",
+    });
+  } catch (e) {
+    html = "";
+  }
+
+  if (html && !isChallengeOrEmpty(html)) {
+    try {
+      // Cap cached HTML size to stay under 256 KB storage budget
+      var toStore = html.length > 180000 ? html.slice(0, 180000) : html;
+      kino.storage.set(
+        CACHE_KEY,
+        JSON.stringify({ html: toStore, ts: Date.now() }),
+        { ttlMs: CACHE_TTL_MS }
+      );
+    } catch (e) {}
+    rows = buildRows();
+    if (rows.length) return rows;
+  }
+
+  // 3) Stale cache better than empty / timeout
+  try {
+    var raw2 = kino.storage.get(CACHE_KEY);
+    if (raw2) {
+      var stale = JSON.parse(raw2);
+      if (stale && stale.html) {
+        html = stale.html;
+        rows = buildRows();
+        if (rows.length) return rows;
+      }
+    }
+  } catch (e) {}
+
+  // 4) Always return something so Kino never records home [timeout]
+  return [
+    {
       id: "inicio",
-      title: "FlixLatam",
+      title: "FlixLatam (sitio no disponible)",
       items: [],
       ref: "/peliculas",
-    });
-  }
-
-  return rows;
+    },
+  ];
 }
 
 export async function browse(ref, cursor) {
   var path = ref || "/";
   if (cursor) path = cursor;
   if (path.indexOf("http") === 0) path = pathFromUrl(path);
-  if (path === "/?section=ultimos") {
-    var ult = parseLatestEpisodes(await get("/")).slice(0, 100);
-    return { items: ult, next: null };
+  var html = "";
+  try {
+    html = await readPage(path === "/?section=ultimos" ? "/" : path, {
+      fetchMs: 8000,
+      browserMs: 8000,
+      waitFor: "article",
+    });
+  } catch (e) {
+    return { items: [] };
   }
-  var html = await get(path);
+  if (!html) return { items: [] };
+  if (path === "/?section=ultimos") {
+    return { items: parseLatestEpisodes(html).slice(0, 100), next: null };
+  }
   var parsed = parsePageItems(html, path);
-  // máximo 100 ítems por página (límite de Kino)
   return {
     items: (parsed.items || []).slice(0, 100),
     next: parsed.next || undefined,
@@ -965,9 +1173,31 @@ export async function resolve(ref) {
   }
 
   var pagePath = String(path).replace(/\/$/, "");
-  var html = await get(pagePath);
+  var html = "";
+  try {
+    html = await readPage(pagePath, {
+      fetchMs: 10000,
+      browserMs: 10000,
+      waitFor: "iframe",
+    });
+  } catch (e) {
+    html = "";
+  }
+  if (!html) {
+    throw kino.error("unavailable", "page load failed", {
+      userMessage:
+        "No se pudo cargar la página del título. El sitio puede estar caído; inténtalo más tarde.",
+    });
+  }
   var players = parsePlayers(html);
 
+  if (!players.length) {
+    // Some layouts put vidurl path only in scripts
+    var vm = html.match(/\/vidurl\/[A-Za-z0-9_/.-]+/);
+    if (vm) {
+      players.push({ name: "Embed69", url: abs(vm[0]) });
+    }
+  }
   if (!players.length) {
     throw kino.error("unavailable", "no players", {
       userMessage: "No hay servidores disponibles para este título.",

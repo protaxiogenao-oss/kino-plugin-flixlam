@@ -1,7 +1,7 @@
 {
   "id": "flixlatam",
   "name": "FlixLatam",
-  "version": "1.2.1",
+  "version": "1.2.3",
   "apiVersion": 6,
   "entry": "plugin.js",
   "description": "Series, películas y anime en latino, castellano e inglés sub español",
@@ -48,7 +48,10 @@
     "hqq.tv",
     "*.hqq.tv",
     "rapidvideo.link",
-    "*.rapidvideo.link"
+    "*.rapidvideo.link",
+    "acek-cdn.com",
+    "*.acek-cdn.com",
+    "pixibay.cc"
   ],
   "streamHosts": "any",
   "capabilities": [
@@ -105,31 +108,31 @@
       "key": "preferServer",
       "label": "Servidor preferido",
       "type": "select",
-      "default": "streamwish",
+      "default": "vidhide",
       "options": [
         {
           "value": "auto",
           "label": "Automático"
         },
         {
-          "value": "streamwish",
-          "label": "Streamwish"
+          "value": "vidhide",
+          "label": "Vidhide (recomendado)"
         },
         {
-          "value": "voe",
-          "label": "Voe"
+          "value": "streamwish",
+          "label": "Streamwish"
         },
         {
           "value": "filemoon",
           "label": "Filemoon"
         },
         {
-          "value": "vidhide",
-          "label": "Vidhide"
-        },
-        {
           "value": "rapidvideo",
           "label": "Rapidvideo"
+        },
+        {
+          "value": "voe",
+          "label": "Voe (puede pedir captcha)"
         }
       ]
     }
