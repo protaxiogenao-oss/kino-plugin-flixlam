@@ -1,11 +1,11 @@
 /// <reference path="./kino.d.ts" />
 /**
- * FlixLatam plugin for Kino — v1.2.5
+ * FlixLatam plugin for Kino — v1.2.6
  * Hecho por Hotaru Yume. Series, películas y anime en latino (flixlatam.com)
- * Resolve: Embed69 (Anubis+AES) → Vidhide / Streamwish / Filemoon → browser.capture
- * v1.2.5: Anubis en embed69.org, browser.page primero, PoW fallback, capture último recurso
+ * Resolve: Embed69 Anubis PoW+cookies → AES → Vidhide / Streamwish / Filemoon
+ * v1.2.6: PoW Anubis obligatorio (getSoft no descartaba el challenge), cookies kino.fetch
+ * v1.2.5: browser.page / capture
  * v1.2.4: episodios #sN-eM, home por secciones h2
- * v1.2.3: cifrado LINK_CHALLENGE, prioriza Vidhide
  */
 
 const BASE = "https://flixlatam.com";
@@ -83,31 +83,31 @@ function solveAnubisFast(randomData, difficulty) {
 }
 
 /**
- * If HTML is Anubis gate, solve PoW and re-fetch the real page.
- * Returns usable HTML or "".
+ * If HTML is Anubis gate, solve PoW; kino.fetch stores the auth cookie (cookies:true)
+ * and the pass-challenge redirect usually returns the real player body.
  */
 async function passAnubisAndFetch(pageUrl, challengeHtml, referer) {
   try {
     var cm = challengeHtml.match(
-      /id=["']anubis_challenge["'][^>]*>\s*(\{[\s\S]*?\})\s*<\/script>/i
+      /<script[^>]*id=["']anubis_challenge["'][^>]*>([\s\S]*?)<\/script>/i
     );
     if (!cm) {
       cm = challengeHtml.match(
-        /<script[^>]*id=["']anubis_challenge["'][^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/i
+        /id=["']anubis_challenge["'][^>]*>\s*(\{[\s\S]*?\})\s*<\/script>/i
       );
     }
     if (!cm) return "";
-    var payload = JSON.parse(cm[1]);
+    var payload = JSON.parse(cm[1].trim());
     var rules = payload.rules || {};
     var ch = payload.challenge || payload;
-    var difficulty = (rules.difficulty != null
-      ? rules.difficulty
-      : ch.difficulty) || 4;
+    var difficulty =
+      rules.difficulty != null ? rules.difficulty : ch.difficulty || 4;
     var randomData = ch.randomData;
     var id = ch.id;
     if (!randomData || !id) return "";
     var solved = solveAnubisFast(randomData, difficulty);
     if (!solved) return "";
+
     var base = "https://embed69.org";
     try {
       base = pageUrl.match(/^(https?:\/\/[^/]+)/i)[1];
@@ -115,7 +115,9 @@ async function passAnubisAndFetch(pageUrl, challengeHtml, referer) {
     var redir = "/";
     try {
       redir = pageUrl.replace(base, "") || "/";
+      if (redir.charAt(0) !== "/") redir = "/" + redir;
     } catch (e2) {}
+
     var passUrl =
       base +
       "/.within.website/x/cmd/anubis/api/pass-challenge?id=" +
@@ -126,57 +128,102 @@ async function passAnubisAndFetch(pageUrl, challengeHtml, referer) {
       encodeURIComponent(String(solved.nonce)) +
       "&redir=" +
       encodeURIComponent(redir) +
-      "&elapsedTime=100";
+      "&elapsedTime=250";
+
     var r = await kino.fetch(passUrl, {
       headers: hdr({ Referer: pageUrl }),
-      timeoutMs: 15000,
+      timeoutMs: 25000,
+      cookies: true,
     });
-    // Prefer body of pass response if it already is the player
+    var body = "";
     try {
-      var body = await r.text();
-      if (body && /dataLink|LINK_CHALLENGE|sortedEmbeds/i.test(body) && !isAnubisHtml(body)) {
-        return body;
-      }
-    } catch (e3) {}
-    // Re-fetch original URL (auth cookie may now be stored for the host)
-    var html2 = await getSoft(pageUrl, referer || BASE + "/", 12000);
-    if (html2 && !isChallengeOrEmpty(html2) && !isAnubisHtml(html2)) return html2;
+      body = await r.text();
+    } catch (e3) {
+      body = "";
+    }
+    // Redirect often lands on the real player with dataLink
+    if (
+      body &&
+      /dataLink|LINK_CHALLENGE|sortedEmbeds/i.test(body) &&
+      !isAnubisHtml(body)
+    ) {
+      return body;
+    }
+    // Cookie should be stored: fetch original again
+    var html2 = await getRaw(pageUrl, referer || BASE + "/", 15000);
+    if (
+      html2 &&
+      /dataLink|LINK_CHALLENGE|sortedEmbeds/i.test(html2) &&
+      !isAnubisHtml(html2)
+    ) {
+      return html2;
+    }
     return "";
   } catch (e) {
+    try {
+      kino.log && kino.log("anubis pass failed: " + (e && e.message));
+    } catch (e4) {}
     return "";
   }
 }
 
-/** Load embed69 / player HTML: fetch → Anubis PoW → browser.page */
+/** Load embed69 / player HTML: raw fetch → Anubis PoW → browser last. */
 async function loadPlayerHtml(playerUrl) {
-  var html = await getSoft(playerUrl, BASE + "/", 8000);
-  if (html && !isChallengeOrEmpty(html) && /dataLink|LINK_CHALLENGE|sortedEmbeds/i.test(html)) {
+  // 1) Raw fetch (keep Anubis challenge HTML — getSoft would discard it)
+  var html = await getRaw(playerUrl, BASE + "/", 12000);
+  if (
+    html &&
+    /dataLink|LINK_CHALLENGE|sortedEmbeds/i.test(html) &&
+    !isAnubisHtml(html)
+  ) {
     return html;
   }
-  // Anubis gate: try pure PoW (works without WebView)
+
+  // 2) Anubis PoW (works on device without WebView; ~0.2s for difficulty 4)
   if (html && isAnubisHtml(html)) {
     var passed = await passAnubisAndFetch(playerUrl, html, BASE + "/");
     if (passed) return passed;
+  } else if (!html) {
+    // Empty: try once more to get challenge page
+    html = await getRaw(playerUrl, BASE + "/", 12000);
+    if (html && isAnubisHtml(html)) {
+      var passed2 = await passAnubisAndFetch(playerUrl, html, BASE + "/");
+      if (passed2) return passed2;
+    }
+    if (
+      html &&
+      /dataLink|LINK_CHALLENGE|sortedEmbeds/i.test(html) &&
+      !isAnubisHtml(html)
+    ) {
+      return html;
+    }
   }
-  // Hidden browser: runs Anubis JS and yields the real player HTML
+
+  // 3) Hidden browser only if PoW failed (slow; often Access Denied on datacenter IPs)
   try {
     if (kino.browser && typeof kino.browser.page === "function") {
       var page = await kino.browser.page(playerUrl, {
         waitFor: "dataLink",
-        timeoutMs: 22000,
+        timeoutMs: 20000,
       });
-      if (page && page.html && !isAnubisHtml(page.html)) {
-        if (/dataLink|LINK_CHALLENGE|sortedEmbeds/i.test(page.html)) return page.html;
-      }
-      // Wait for LINK_CHALLENGE if dataLink selector missed
-      if (page && page.html && /LINK_CHALLENGE|sortedEmbeds/i.test(page.html) && !isAnubisHtml(page.html)) {
+      if (
+        page &&
+        page.html &&
+        /dataLink|LINK_CHALLENGE|sortedEmbeds/i.test(page.html) &&
+        !isAnubisHtml(page.html)
+      ) {
         return page.html;
       }
     }
   } catch (e) {}
-  // Second chance: raw fetch after browser warmed cookies
-  html = await getSoft(playerUrl, BASE + "/", 10000);
-  if (html && !isChallengeOrEmpty(html) && /dataLink|sortedEmbeds/i.test(html)) {
+
+  // 4) Cookie may have been set by browser
+  html = await getRaw(playerUrl, BASE + "/", 10000);
+  if (
+    html &&
+    /dataLink|sortedEmbeds/i.test(html) &&
+    !isAnubisHtml(html)
+  ) {
     return html;
   }
   return "";
@@ -208,11 +255,28 @@ async function getSoft(url, referer, timeoutMs) {
     var r = await kino.fetch(full, {
       headers: hdr(referer ? { Referer: referer } : null),
       timeoutMs: timeoutMs || 6000,
+      cookies: true,
     });
     if (!r.ok) return "";
     var text = await r.text();
     if (isChallengeOrEmpty(text)) return "";
     return text;
+  } catch (e) {
+    return "";
+  }
+}
+
+/** Fetch raw HTML even if it is an Anubis / CF challenge page. */
+async function getRaw(url, referer, timeoutMs) {
+  try {
+    var full = url.indexOf("http") === 0 ? url : BASE + url;
+    var r = await kino.fetch(full, {
+      headers: hdr(referer ? { Referer: referer } : null),
+      timeoutMs: timeoutMs || 10000,
+      cookies: true,
+    });
+    if (!r.ok) return "";
+    return await r.text();
   } catch (e) {
     return "";
   }
