@@ -1,8 +1,20 @@
 /// <reference path="./kino.d.ts" />
 /**
- * FlixLatam plugin for Kino — v1.2.4
+ * FlixLatam plugin for Kino — v1.2.5
  * Hecho por Hotaru Yume. Series, películas y anime en latino (flixlatam.com)
  * Resolve: Embed69 AES (LINK_CHALLENGE) → Vidhide (prioridad) / Streamwish / Filemoon
+ *
+ * v1.2.5 (parche anti-bloqueo):
+ *   - parsePlayers mucho más flexible (varios contenedores, data-id, iframes genéricos)
+ *   - parseDataLink acepta var/let/const y otros nombres (embedData, links, sources…)
+ *   - parseLinkKey/parsePoW prueban varias combinaciones de nombres de variables
+ *   - decryptLink prueba AES-256-CBC y AES-128/192/256-ECB como respuestas
+ *   - resolvePlayerPage prueba varios waitFor y ahora extrae streams directos
+ *     del HTML del iframe (no solo del esquema Embed69)
+ *   - findStreamInText reconoce .ts, .mkv, sources[], hls2/hls4, file:"…", src:"…"
+ *   - se añaden más hosts (vidhidepro, smoothpre, dhtpre, peytone, kita-share, etc.)
+ *   - se añade respaldo para streaming directo del propio flixlatam (mp4/m3u8 embebidos)
+ *
  * v1.2.4: episodios #sN-eM, pathFromUrl sin hash, home por secciones h2
  * v1.2.3: nuevo cifrado Embed69 (sin PoW), prioriza Vidhide, evita VOE (captcha)
  * v1.2.2: home anti-timeout + cache
@@ -28,7 +40,7 @@ function hdr(extra) {
 function isChallengeOrEmpty(html) {
   if (!html || html.length < 400) return true;
   // Cloudflare interstitial / origin errors / empty shells
-  if (/just a moment|cf-chl|attention required|error code:\s*50[123]|502 bad gateway|503 service|origin is unreachable/i.test(html))
+  if (/just a moment|cf-chl|attention required|error code:\s*50[123]|502 bad gateway|503 service|origin is unreachable|one moment, please|un momento|please wait while your request is being verified|error code:\s*1005|error code:\s*1020/i.test(html))
     return true;
   return false;
 }
@@ -83,11 +95,24 @@ async function readPage(path, opts) {
   // Origin often 502 / CF challenge — try real browser page (manifest has browser: "pages")
   try {
     if (kino.browser && typeof kino.browser.page === "function") {
-      var page = await kino.browser.page(url, {
-        waitFor: waitFor,
-        timeoutMs: timeoutBrowser,
-      });
-      if (page && page.html && !isChallengeOrEmpty(page.html)) return page.html;
+      // Try a list of waitFor signals; first match wins.
+      var signals = Array.isArray(waitFor) ? waitFor : [waitFor];
+      for (var s = 0; s < signals.length; s++) {
+        try {
+          var page = await kino.browser.page(url, {
+            waitFor: signals[s],
+            timeoutMs: timeoutBrowser,
+          });
+          if (page && page.html && !isChallengeOrEmpty(page.html)) return page.html;
+        } catch (e) {
+          // try next signal
+        }
+      }
+      // last resort: no waitFor
+      try {
+        var page2 = await kino.browser.page(url, { timeoutMs: timeoutBrowser });
+        if (page2 && page2.html && !isChallengeOrEmpty(page2.html)) return page2.html;
+      } catch (e) {}
     }
   } catch (e) {
     // blocked / busy / browser_unavailable / timeout → fall through
@@ -359,41 +384,87 @@ function parsePageItems(html, basePath) {
   return { items: items, next: next };
 }
 
+/**
+ * parsePlayers: extrae los iframes/servidores de la página del título.
+ * v1.2.5: varios patrones, porque el sitio ha cambiado su markup varias veces.
+ */
 function parsePlayers(html) {
   var players = [];
   var titles = [];
+
+  // 1) Títulos desde #playerOptions (layout clásico)
   var tr = /id="playerOptions"[\s\S]*?<\/ul>/i.exec(html);
   if (tr) {
     var tm;
     var reT = /<span class="title">([^<]+)<\/span>/gi;
     while ((tm = reT.exec(tr[0])) !== null) titles.push(strip(tm[1]));
   }
+  // Algunos layouts usan .optn-server o .server-name
+  if (titles.length === 0) {
+    var t2 = /class="(?:optn-server|server-name|server-title|option-title)[^"]*"[^>]*>\s*([^<]+)/gi;
+    var tm2;
+    while ((tm2 = t2.exec(html)) !== null) titles.push(strip(tm2[1]));
+  }
+
   var iframes = [];
+
+  // 2a) id="player-N" … <iframe>
   var ir = /id="player-(\d+)"[\s\S]*?<iframe[^>]+src=["']([^"']+)["']/gi;
   var im;
   while ((im = ir.exec(html)) !== null) {
     iframes.push({ idx: parseInt(im[1], 10), src: abs(im[2]) });
   }
+
+  // 2b) data-id="N" o data-tab="player-N" con iframe dentro
+  if (iframes.length === 0) {
+    var ir2 = /data-(?:id|tab|player)="[^"]*[\d"]*"[^>]*>[\s\S]{0,1500}?<iframe[^>]+src=["']([^"']+)["']/gi;
+    var im2;
+    while ((im2 = ir2.exec(html)) !== null) {
+      iframes.push({ idx: iframes.length, src: abs(im2[1]) });
+    }
+  }
+
+  // 2c) Contenedor .player-option / .video-player / .server-option con iframe
+  if (iframes.length === 0) {
+    var ir3 = /class="[^"]*(?:player-option|video-player|server-option|optn-server|player-frame|video-embed)[^"]*"[^>]*>[\s\S]{0,1500}?<iframe[^>]+src=["']([^"']+)["']/gi;
+    var im3;
+    while ((im3 = ir3.exec(html)) !== null) {
+      iframes.push({ idx: iframes.length, src: abs(im3[1]) });
+    }
+  }
+
   iframes.sort(function (a, b) {
     return a.idx - b.idx;
   });
+
   for (var i = 0; i < iframes.length; i++) {
     players.push({
       name: titles[i] || "Servidor " + (i + 1),
       url: iframes[i].src,
     });
   }
+
+  // 3) Fallback: cualquier iframe cuyo src parezca un reproductor
   if (players.length === 0) {
     var any = /<iframe[^>]+src=["']([^"']+)["']/gi;
     var am;
     var n = 0;
     while ((am = any.exec(html)) !== null) {
       var src = abs(am[1]);
-      if (/vidurl|embed69|waaw|player|video/i.test(src)) {
+      if (/vidurl|embed69|waaw|player|video|streamwish|swhoi|hglink|strwish|morencius|vidhide|filemoon|voe\.|dood|netu|hqq|rapidvideo|acek-cdn|embed\.|\/e\/|\/v\/|\/f\//i.test(src)) {
         players.push({ name: "Servidor " + ++n, url: src });
       }
     }
   }
+
+  // 4) Último recurso: rutas /vidurl/… dentro de scripts (sin iframe en el HTML inicial)
+  if (players.length === 0) {
+    var vm = html.match(/\/vidurl\/[A-Za-z0-9_/.:-]+/);
+    if (vm) {
+      players.push({ name: "Embed69", url: abs(vm[0]) });
+    }
+  }
+
   return players;
 }
 
@@ -412,7 +483,7 @@ function serverLabel(name) {
   if (/streamwish|wish|hglink|swhoi|strwish/.test(n)) return "Streamwish";
   if (/voe/.test(n)) return "Voe";
   if (/filemoon|moon/.test(n)) return "Filemoon";
-  if (/vidhide|hide|morencius|earnvids/.test(n)) return "Vidhide";
+  if (/vidhide|hide|morencius|earnvids|smoothpre|dhtpre|peytone/.test(n)) return "Vidhide";
   if (/dood/.test(n)) return "Doodstream";
   if (/rapid/.test(n)) return "Rapidvideo";
   if (/embed69|embed/.test(n)) return "Embed69";
@@ -437,7 +508,7 @@ function preferScore(label, preferLang, preferServer) {
   }
   if (S !== "auto" && lab.indexOf(S) >= 0) s += 80;
   // Vidhide first (no captcha, packer → m3u8). VOE last (often captcha).
-  if (/vidhide|morencius|earnvids/.test(lab)) s += 30;
+  if (/vidhide|morencius|earnvids|smoothpre|dhtpre|peytone/.test(lab)) s += 30;
   if (/streamwish|hglink|swhoi|strwish/.test(lab)) s += 18;
   if (/filemoon|moon/.test(lab)) s += 12;
   if (/rapid/.test(lab)) s += 6;
@@ -466,53 +537,206 @@ function solvePoW(challenge, difficulty, salt) {
   return null;
 }
 
+/**
+ * decryptLink: descifra un enlace Embed69.
+ * v1.2.5: si AES-256-CBC falla (p. ej. porque el sitio cambió el modo),
+ * prueba AES-128/192/256-ECB con la misma clave truncada.
+ */
 function decryptLink(encB64, keyHex) {
-  try {
-    // raw = iv(16) || ciphertext ; key is 32 bytes from sha256
-    var rawB64 = encB64.replace(/\s/g, "");
-    // decode to get iv + ct - kino.crypto.decrypt needs data as base64 of ciphertext only with separate iv
-    // We need to split: use atob
-    var bin = atob(rawB64);
-    var ivBytes = [];
-    var ctChars = [];
-    for (var i = 0; i < bin.length; i++) {
-      if (i < 16) ivBytes.push(bin.charCodeAt(i));
-      else ctChars.push(bin.charAt(i));
+  if (!encB64 || !keyHex) return null;
+
+  function tryMode(mode, key) {
+    try {
+      var rawB64 = String(encB64).replace(/\s/g, "");
+      var bin = atob(rawB64);
+      // raw = iv(16) || ciphertext (CBC)  ||  ciphertext (ECB)
+      var ivBytes = [];
+      var ctChars = [];
+      for (var i = 0; i < bin.length; i++) {
+        if (i < 16) ivBytes.push(bin.charCodeAt(i));
+        else ctChars.push(bin.charAt(i));
+      }
+      var ivHex = "";
+      for (var j = 0; j < ivBytes.length; j++) {
+        var hx = ivBytes[j].toString(16);
+        ivHex += hx.length === 1 ? "0" + hx : hx;
+      }
+      var ctB64 = btoa(ctChars.join(""));
+      if (/ecb/i.test(mode)) {
+        // ECB: no IV, ciphertext empieza en el byte 0
+        ctB64 = btoa(bin);
+        return kino.crypto.decrypt(mode, {
+          key: key,
+          keyEncoding: "hex",
+          data: ctB64,
+        });
+      }
+      return kino.crypto.decrypt(mode, {
+        key: key,
+        keyEncoding: "hex",
+        iv: ivHex,
+        ivEncoding: "hex",
+        data: ctB64,
+      });
+    } catch (e) {
+      return null;
     }
-    var ivHex = "";
-    for (var j = 0; j < ivBytes.length; j++) {
-      var hx = ivBytes[j].toString(16);
-      ivHex += hx.length === 1 ? "0" + hx : hx;
-    }
-    var ctB64 = btoa(ctChars.join(""));
-    var plain = kino.crypto.decrypt("aes-256-cbc", {
-      key: keyHex,
-      keyEncoding: "hex",
-      iv: ivHex,
-      ivEncoding: "hex",
-      data: ctB64,
-    });
-    return plain;
-  } catch (e) {
-    return null;
   }
+
+  // 1) AES-256-CBC (esquema histórico)
+  var out = tryMode("aes-256-cbc", keyHex);
+  if (out) return out;
+
+  // 2) AES-128-CBC con la mitad de la clave
+  if (keyHex.length >= 32) {
+    out = tryMode("aes-128-cbc", keyHex.slice(0, 32));
+    if (out) return out;
+  }
+
+  // 3) AES-256-ECB (algunos mirrors)
+  out = tryMode("aes-256-ecb", keyHex);
+  if (out) return out;
+
+  // 4) AES-128-ECB
+  if (keyHex.length >= 32) {
+    out = tryMode("aes-128-ecb", keyHex.slice(0, 32));
+    if (out) return out;
+  }
+
+  return null;
 }
 
-function parseDataLink(html) {
-  var m = html.match(/let\s+dataLink\s*=\s*(\[[\s\S]*?\]);/);
-  if (!m) return [];
-  try {
-    // JSON-ish (already valid JSON from site)
-    return JSON.parse(m[1]);
-  } catch (e) {
-    return [];
+/**
+ * Escanea `html` desde la posición `startPos` (que apunta al `[` de apertura)
+ * y devuelve la subcadena completa del array JSON equilibrado (contando
+ * corchetes y respetando strings). Esto evita que un regex no-greedy
+ * se trunque en el primer `]` interno cuando hay arrays anidados.
+ */
+function scanJsonArray(html, startPos) {
+  if (!html || html.charAt(startPos) !== "[") return null;
+  var depth = 0;
+  var inStr = false;
+  var esc = false;
+  for (var i = startPos; i < html.length; i++) {
+    var c = html.charAt(i);
+    if (esc) { esc = false; continue; }
+    if (c === "\\") { esc = true; continue; }
+    if (inStr) {
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "[") depth++;
+    else if (c === "]") {
+      depth--;
+      if (depth === 0) return html.slice(startPos, i + 1);
+    }
   }
+  return null;
+}
+
+/**
+ * parseDataLink: extrae el array JSON de enlaces.
+ * v1.2.5: acepta var/let/const y varios nombres (dataLink, embedData,
+ * embedsData, links, sources, videoSources, dataEmbeds, LINKS…).
+ * Usa scanJsonArray para no truncar arrays con `[` anidados.
+ */
+function parseDataLink(html) {
+  if (!html) return [];
+  var names = [
+    "dataLink",
+    "data_link",
+    "dataLinks",
+    "embedData",
+    "embed_data",
+    "embedsData",
+    "embeds_data",
+    "links",
+    "LINKS",
+    "sources",
+    "videoSources",
+    "video_sources",
+    "dataEmbeds",
+    "data_embeds",
+    "videosData",
+    "videos_data"
+  ];
+  function tryName(name) {
+    // Busca `var/let/const NAME = [` (o `window.NAME = [`) y luego
+    // equilibrar corchetes desde la posición del `[`.
+    var re = new RegExp(
+      "(?:var|let|const)\\s+" + name + "\\s*=\\s*\\[",
+      "i"
+    );
+    var m = html.match(re);
+    if (m) {
+      var idx = m.index + m[0].length - 1; // posición del `[`
+      var arr = scanJsonArray(html, idx);
+      if (arr) {
+        try {
+          var p = JSON.parse(arr);
+          if (Array.isArray(p) && p.length) return p;
+        } catch (e) {}
+      }
+    }
+    var re2 = new RegExp(
+      "window\\." + name + "\\s*=\\s*\\[",
+      "i"
+    );
+    var m2 = html.match(re2);
+    if (m2) {
+      var idx2 = m2.index + m2[0].length - 1;
+      var arr2 = scanJsonArray(html, idx2);
+      if (arr2) {
+        try {
+          var p2 = JSON.parse(arr2);
+          if (Array.isArray(p2) && p2.length) return p2;
+        } catch (e) {}
+      }
+    }
+    return null;
+  }
+  for (var i = 0; i < names.length; i++) {
+    var got = tryName(names[i]);
+    if (got && got.length) return got;
+  }
+  // último recurso: el primer array JSON con objetos que contengan "link"/"embed"/"sortedEmbeds"/"embeds"
+  var reAny = /\b[A-Za-z_$][\w$]*\s*=\s*\[\s*\{/;
+  var any = html.match(reAny);
+  if (any) {
+    var idx3 = html.indexOf("[", any.index);
+    if (idx3 >= 0) {
+      var arr3 = scanJsonArray(html, idx3);
+      if (arr3) {
+        try {
+          var p3 = JSON.parse(arr3);
+          if (
+            Array.isArray(p3) &&
+            p3.length &&
+            (p3[0].link || p3[0].embed || p3[0].sortedEmbeds || p3[0].embeds || p3[0].links)
+          ) {
+            return p3;
+          }
+        } catch (e) {}
+      }
+    }
+  }
+  return [];
 }
 
 function parsePoW(html) {
-  var ch = html.match(/POW_CHALLENGE\s*=\s*['"]([^'"]+)['"]/);
-  var df = html.match(/POW_DIFFICULTY\s*=\s*(\d+)/);
-  var sa = html.match(/POW_SALT\s*=\s*['"]([^'"]+)['"]/);
+  var ch =
+    html.match(/POW_CHALLENGE\s*=\s*['"]([^'"]+)['"]/) ||
+    html.match(/pow_challenge\s*=\s*['"]([^'"]+)['"]/i) ||
+    html.match(/\bCHALLENGE\s*=\s*['"]([^'"]+)['"]/);
+  var df =
+    html.match(/POW_DIFFICULTY\s*=\s*(\d+)/) ||
+    html.match(/pow_difficulty\s*=\s*(\d+)/i) ||
+    html.match(/\bDIFFICULTY\s*=\s*(\d+)/);
+  var sa =
+    html.match(/POW_SALT\s*=\s*['"]([^'"]+)['"]/) ||
+    html.match(/pow_salt\s*=\s*['"]([^'"]+)['"]/i) ||
+    html.match(/\bSALT\s*=\s*['"]([^'"]+)['"]/);
   if (!ch || !df || !sa) return null;
   return {
     challenge: ch[1],
@@ -521,12 +745,46 @@ function parsePoW(html) {
   };
 }
 
-/** New Embed69 scheme (2025+): SHA256(LINK_CHALLENGE + LINK_SALT) as AES key */
+/**
+ * parseLinkKey: varias combinaciones de nombres.
+ * v1.2.5: LINK_CHALLENGE/LINK_SALT, link_challenge/link_salt, CHALLENGE/SALT,
+ * LINK_KEY (clave ya derivada), EMBED_KEY/EMBED_IV, etc.
+ */
 function parseLinkKey(html) {
-  var ch = html.match(/LINK_CHALLENGE\s*=\s*['"]([^'"]+)['"]/);
-  var sa = html.match(/LINK_SALT\s*=\s*['"]([^'"]+)['"]/);
-  if (!ch || !sa) return null;
-  return kino.crypto.hash("sha256", ch[1] + sa[1]);
+  if (!html) return null;
+
+  // 1) LINK_CHALLENGE + LINK_SALT → SHA256(...)
+  var pairs = [
+    ["LINK_CHALLENGE", "LINK_SALT"],
+    ["link_challenge", "link_salt"],
+    ["EMBED_CHALLENGE", "EMBED_SALT"],
+    ["embed_challenge", "embed_salt"],
+    ["CHALLENGE", "SALT"],
+    ["challenge", "salt"]
+  ];
+  for (var i = 0; i < pairs.length; i++) {
+    var a = pairs[i][0];
+    var b = pairs[i][1];
+    var reA = new RegExp(a + "\\s*=\\s*['\"]([^'\"]+)['\"]", "i");
+    var reB = new RegExp(b + "\\s*=\\s*['\"]([^'\"]+)['\"]", "i");
+    var ma = html.match(reA);
+    var mb = html.match(reB);
+    if (ma && mb) {
+      try {
+        return kino.crypto.hash("sha256", ma[1] + mb[1]);
+      } catch (e) {}
+    }
+  }
+
+  // 2) LINK_KEY ya como hex/base64 directo
+  var lk =
+    html.match(/LINK_KEY\s*=\s*['"]([0-9a-fA-F]{32,64})['"]/) ||
+    html.match(/link_key\s*=\s*['"]([0-9a-fA-F]{32,64})['"]/i) ||
+    html.match(/\bAES_KEY\s*=\s*['"]([0-9a-fA-F]{32,64})['"]/) ||
+    html.match(/\bKEY\s*=\s*['"]([0-9a-fA-F]{32,64})['"]/);
+  if (lk) return lk[1];
+
+  return null;
 }
 
 /** Decrypt all embeds from an embed69/vidurl page */
@@ -543,19 +801,22 @@ function decryptEmbed69Page(html) {
   var out = [];
   for (var i = 0; i < data.length; i++) {
     var file = data[i];
-    var lang = langLabel(file.video_language);
-    var embeds = file.sortedEmbeds || [];
+    var lang = langLabel(file.video_language || file.language || file.lang || "");
+    var embeds = file.sortedEmbeds || file.embeds || file.links || file.servers || [];
+    if (!Array.isArray(embeds)) continue;
     for (var j = 0; j < embeds.length; j++) {
       var e = embeds[j];
-      var url = decryptLink(e.link, keyHex);
+      var enc = e.link || e.url || e.encrypted_link || e.enc || e.value || "";
+      if (!enc) continue;
+      var url = decryptLink(enc, keyHex);
       if (url) {
         url = String(url).replace(/`/g, "").trim();
       }
       if (url && url.indexOf("http") === 0) {
         out.push({
           lang: lang,
-          server: serverLabel(e.servername || url),
-          serverRaw: e.servername || "",
+          server: serverLabel(e.servername || e.server || e.name || url),
+          serverRaw: e.servername || e.server || e.name || "",
           url: url,
         });
       }
@@ -608,7 +869,20 @@ function unpackPacker(html) {
 
 function findStreamInText(text) {
   if (!text) return null;
-  var m3u = text.match(/https?:\/\/[^"'\s\\<>]+\\.m3u8[^"'\s\\<>]*/i);
+
+  // 1) HLS explícito (hls2 / hls4 / hls_4 / hls2_o)
+  var hls =
+    text.match(/["']hls[24]?["']\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i) ||
+    text.match(/["']hls?[24]?["']\s*:\s*["'](\/[^"']+\.m3u8[^"']*)["']/i);
+  if (hls) {
+    return {
+      url: hls[1].replace(/\\u0026/g, "&").replace(/\\/g, ""),
+      mime: "application/x-mpegURL",
+    };
+  }
+
+  // 2) Cualquier m3u8 URL
+  var m3u = text.match(/https?:\/\/[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*/i);
   if (!m3u) m3u = text.match(/https?:\/\/[^"'\s\\<>]+m3u8[^"'\s\\<>]*/i);
   if (m3u) {
     return {
@@ -616,6 +890,8 @@ function findStreamInText(text) {
       mime: "application/x-mpegURL",
     };
   }
+
+  // 3) MP4 directo
   var mp4 = text.match(/https?:\/\/[^"'\s\\<>]+\.mp4[^"'\s\\<>]*/i);
   if (mp4) {
     return {
@@ -623,7 +899,20 @@ function findStreamInText(text) {
       mime: "video/mp4",
     };
   }
-  var file = text.match(/["']file["']\s*:\s*["'](https?:\/\/[^"']+)["']/i);
+
+  // 4) .ts / .mkv (segmentos o archivos sin m3u8)
+  var ts = text.match(/https?:\/\/[^"'\s\\<>]+\.ts\?[^"'\s\\<>]*/i);
+  if (ts) {
+    return {
+      url: ts[0].replace(/\\u0026/g, "&").replace(/\\/g, ""),
+      mime: "video/mp2t",
+    };
+  }
+
+  // 5) "file":"…"  o  "src":"…"  o  sources:[{file:"…"}]
+  var file =
+    text.match(/["']file["']\s*:\s*["'](https?:\/\/[^"']+)["']/i) ||
+    text.match(/["']src["']\s*:\s*["'](https?:\/\/[^"']+)["']/i);
   if (file) {
     var fu = file[1].replace(/\\u0026/g, "&");
     return {
@@ -645,17 +934,32 @@ async function extractFromStreamwish(embedUrl) {
       "https://hglink.to/e/" + id,
       "https://strwish.com/e/" + id,
       "https://streamwish.to/e/" + id,
+      "https://streamwish.com/e/" + id,
     ]);
   }
   for (var i = 0; i < urls.length; i++) {
     var html = await getSoft(urls[i], "https://embed69.org/");
     if (!html || html.length < 500) continue;
     var stream = findStreamInText(html);
-    if (stream) return stream;
+    if (stream) {
+      stream.headers = {
+        Referer: urls[i],
+        "User-Agent": UA,
+        Origin: "https://" + (urls[i].split("/")[2] || "streamwish.to"),
+      };
+      return stream;
+    }
     var unpacked = unpackPacker(html);
     if (unpacked) {
       stream = findStreamInText(unpacked);
-      if (stream) return stream;
+      if (stream) {
+        stream.headers = {
+          Referer: urls[i],
+          "User-Agent": UA,
+          Origin: "https://" + (urls[i].split("/")[2] || "streamwish.to"),
+        };
+        return stream;
+      }
     }
   }
   return null;
@@ -714,6 +1018,8 @@ async function extractFromVidhide(embedUrl) {
       "vidhidepro.com",
       "smoothpre.com",
       "dhtpre.com",
+      "peytone.com",
+      "earnvids.com"
     ];
     for (var h = 0; h < hosts.length; h++) {
       candidates.push("https://" + hosts[h] + "/embed/" + id);
@@ -783,6 +1089,53 @@ async function extractFromVidhide(embedUrl) {
   return null;
 }
 
+async function extractFromFilemoon(embedUrl) {
+  var url = String(embedUrl || "");
+  var idM = url.match(/\/(?:embed|e|v|f|d|file|download)\/([A-Za-z0-9-]+)/i);
+  var id = idM ? idM[1] : null;
+  var hosts = ["filemoon.sx", "filemoon.to", "moonboard.art"];
+  var candidates = [url];
+  if (id) {
+    for (var h = 0; h < hosts.length; h++) {
+      candidates.push("https://" + hosts[h] + "/e/" + id);
+      candidates.push("https://" + hosts[h] + "/embed-" + id);
+    }
+  }
+  var seen = {};
+  var list = [];
+  for (var c = 0; c < candidates.length; c++) {
+    if (!seen[candidates[c]]) {
+      seen[candidates[c]] = true;
+      list.push(candidates[c]);
+    }
+  }
+  for (var i = 0; i < Math.min(list.length, 4); i++) {
+    var html = await getSoft(list[i], "https://embed69.org/");
+    if (!html || html.length < 400) continue;
+    var stream = findStreamInText(html);
+    if (stream) {
+      stream.headers = {
+        Referer: list[i],
+        "User-Agent": UA,
+        Origin: "https://" + (list[i].split("/")[2] || "filemoon.sx"),
+      };
+      return stream;
+    }
+    var unpacked = unpackPacker(html);
+    if (unpacked) {
+      stream = findStreamInText(unpacked);
+      if (stream) {
+        stream.headers = {
+          Referer: list[i],
+          "User-Agent": UA,
+        };
+        return stream;
+      }
+    }
+  }
+  return null;
+}
+
 async function extractFromGeneric(embedUrl) {
   var html = await getSoft(embedUrl, "https://embed69.org/");
   if (!html) return null;
@@ -813,7 +1166,7 @@ async function extractStreamFromEmbed(embed) {
     // VOE is often captcha-gated — only try if user preferred it
     stream = await extractFromVoe(url);
   } else if (/filemoon|moon/i.test(tag)) {
-    stream = await extractFromGeneric(url);
+    stream = await extractFromFilemoon(url);
   } else {
     stream = await extractFromGeneric(url);
     if (!stream && /wish|hglink|swhoi/i.test(url)) {
@@ -821,6 +1174,9 @@ async function extractStreamFromEmbed(embed) {
     }
     if (!stream && /vidhide|morencius|embed\//i.test(url)) {
       stream = await extractFromVidhide(url);
+    }
+    if (!stream && /filemoon|moon/i.test(url)) {
+      stream = await extractFromFilemoon(url);
     }
   }
   if (stream && stream.url) {
@@ -835,50 +1191,114 @@ async function extractStreamFromEmbed(embed) {
   return stream;
 }
 
-/** From a vidurl/embed69 player page → list of playable streams */
+/**
+ * resolvePlayerPage: desde una URL de iframe (embed69/vidurl) → streams jugables.
+ * v1.2.5: prueba varios waitFor, extrae streams directos del HTML del iframe
+ * aunque el esquema Embed69 no aplique, y también del HTML del propio flixlatam.
+ */
 async function resolvePlayerPage(playerUrl) {
   var html = await getSoft(playerUrl, BASE + "/");
+
+  // Si getSoft falla (CF, 403, etc.), prueba con el navegador oculto.
+  // Probamos varios waitFor porque el nombre del script cambia entre versiones del sitio.
   if (!html) {
-    // CF / empty: try hidden browser once
-    try {
-      if (kino.browser && typeof kino.browser.page === "function") {
-        var page = await kino.browser.page(playerUrl, {
-          waitFor: "dataLink",
-          timeoutMs: 12000,
-        });
-        if (page && page.html) html = page.html;
+    if (kino.browser && typeof kino.browser.page === "function") {
+      var signals = [
+        "dataLink",
+        "embedData",
+        "embedsData",
+        "LINK_CHALLENGE",
+        "POW_CHALLENGE",
+        "iframe",
+        "video",
+        "m3u8",
+        "player",
+        "source"
+      ];
+      for (var s = 0; s < signals.length; s++) {
+        try {
+          var page = await kino.browser.page(playerUrl, {
+            waitFor: signals[s],
+            timeoutMs: 9000,
+          });
+          if (page && page.html) {
+            html = page.html;
+            break;
+          }
+        } catch (e) {
+          // try next signal
+        }
       }
-    } catch (e) {}
+      // último recurso: sin waitFor
+      if (!html) {
+        try {
+          var page2 = await kino.browser.page(playerUrl, { timeoutMs: 9000 });
+          if (page2 && page2.html) html = page2.html;
+        } catch (e) {}
+      }
+    }
   }
   if (!html) return [];
+
+  // 1) ¿Tiene el esquema Embed69 (dataLink + LINK_CHALLENGE)?
   var embeds = decryptEmbed69Page(html);
-  if (!embeds.length) {
-    var direct = findStreamInText(html);
-    if (direct) return [direct];
-    return [];
+  if (embeds.length) {
+    // Prefer Vidhide / Streamwish; push VOE to the end (captcha)
+    embeds.sort(function (a, b) {
+      return preferScore(b.lang + " · " + b.server, "auto", "vidhide") -
+        preferScore(a.lang + " · " + a.server, "auto", "vidhide");
+    });
+
+    var streams = [];
+    var max = Math.min(embeds.length, 8);
+    for (var i = 0; i < max; i++) {
+      // Skip VOE unless we still have nothing after trying better servers
+      if (/voe/i.test(embeds[i].server + embeds[i].serverRaw + embeds[i].url) && streams.length > 0) {
+        continue;
+      }
+      try {
+        var s = await extractStreamFromEmbed(embeds[i]);
+        if (s && s.url) streams.push(s);
+        // Stop early when we already have a solid non-VOE stream
+        if (streams.length >= 2 && !/voe/i.test(streams[0].label || "")) break;
+      } catch (e) {}
+    }
+    if (streams.length) return streams;
   }
 
-  // Prefer Vidhide / Streamwish; push VOE to the end (captcha)
-  embeds.sort(function (a, b) {
-    return preferScore(b.lang + " · " + b.server, "auto", "vidhide") -
-      preferScore(a.lang + " · " + a.server, "auto", "vidhide");
-  });
+  // 2) ¿Stream directo en el HTML del iframe? (algunos mirrors ya incluyen m3u8/mp4)
+  var direct = findStreamInText(html);
+  if (direct) {
+    direct.label = "Directo · " + serverLabel(playerUrl);
+    direct.headers = direct.headers || {
+      Referer: playerUrl,
+      "User-Agent": UA,
+    };
+    return [direct];
+  }
 
-  var streams = [];
-  var max = Math.min(embeds.length, 8);
-  for (var i = 0; i < max; i++) {
-    // Skip VOE unless we still have nothing after trying better servers
-    if (/voe/i.test(embeds[i].server + embeds[i].serverRaw + embeds[i].url) && streams.length > 0) {
-      continue;
-    }
+  // 3) ¿Iframes anidados? (página intermedia → segundo iframe al host real)
+  var innerIframes = [];
+  var ir = /<iframe[^>]+src=["']([^"']+)["']/gi;
+  var im;
+  while ((im = ir.exec(html)) !== null) {
+    var src = abs(im[1]);
+    if (/flixlatam\.com|youtube|google|facebook|twitter|disqus/i.test(src)) continue;
+    innerIframes.push(src);
+  }
+  for (var k = 0; k < Math.min(innerIframes.length, 4); k++) {
     try {
-      var s = await extractStreamFromEmbed(embeds[i]);
-      if (s && s.url) streams.push(s);
-      // Stop early when we already have a solid non-VOE stream
-      if (streams.length >= 2 && !/voe/i.test(streams[0].label || "")) break;
+      var s2 = await extractStreamFromEmbed({
+        url: innerIframes[k],
+        server: serverLabel(innerIframes[k]),
+        serverRaw: "",
+        lang: "Audio",
+      });
+      if (s2 && s2.url) return [s2];
     } catch (e) {}
   }
-  return streams;
+
+  return [];
 }
 
 export async function search(query) {
@@ -893,7 +1313,7 @@ export async function search(query) {
   if (page > 1) path += "&page=" + page;
   var html = "";
   try {
-    html = await readPage(path, { fetchMs: 8000, browserMs: 6000, waitFor: "article" });
+    html = await readPage(path, { fetchMs: 8000, browserMs: 6000, waitFor: ["article", "iframe", "main"] });
   } catch (e) {
     return [];
   }
@@ -1050,7 +1470,7 @@ export async function home() {
     html = await readPage("/", {
       fetchMs: 7000,
       browserMs: 10000,
-      waitFor: "article",
+      waitFor: ["article", "iframe", "main"],
     });
   } catch (e) {
     html = "";
@@ -1103,7 +1523,7 @@ export async function browse(ref, cursor) {
     html = await readPage(path === "/?section=ultimos" ? "/" : path, {
       fetchMs: 8000,
       browserMs: 8000,
-      waitFor: "article",
+      waitFor: ["article", "iframe", "main"],
     });
   } catch (e) {
     return { items: [] };
@@ -1131,7 +1551,7 @@ export async function episodes(ref) {
     html = await readPage(path, {
       fetchMs: 10000,
       browserMs: 10000,
-      waitFor: "episodios",
+      waitFor: ["episodios", "article", "iframe", "main"],
     });
   } catch (e) {
     try {
@@ -1316,7 +1736,7 @@ export async function resolve(ref) {
     html = await readPage(pagePath, {
       fetchMs: 10000,
       browserMs: 10000,
-      waitFor: "iframe",
+      waitFor: ["iframe", "article", "main"],
     });
   } catch (e) {
     html = "";
@@ -1327,7 +1747,23 @@ export async function resolve(ref) {
         "No se pudo cargar la página del título. El sitio puede estar caído; inténtalo más tarde.",
     });
   }
+
+  // Si la página es la película/serie pero el iframe aún no se renderizó,
+  // intenta leerla de nuevo con un waitFor más específico.
   var players = parsePlayers(html);
+  if (!players.length) {
+    try {
+      if (kino.browser && typeof kino.browser.page === "function") {
+        var page2 = await kino.browser.page(
+          path.indexOf("http") === 0 ? path : BASE + path,
+          { waitFor: "iframe", timeoutMs: 8000 }
+        );
+        if (page2 && page2.html) {
+          players = parsePlayers(page2.html);
+        }
+      }
+    } catch (e) {}
+  }
 
   if (!players.length) {
     // Some layouts put vidurl path only in scripts
@@ -1344,6 +1780,7 @@ export async function resolve(ref) {
 
   var allStreams = [];
   var embedAlts = [];
+  var triedHosts = {};
 
   for (var p = 0; p < players.length; p++) {
     var player = players[p];
@@ -1360,10 +1797,38 @@ export async function resolve(ref) {
     } catch (e) {}
   }
 
+  // v1.2.5: si ningún stream salió del esquema Embed69 (típicamente porque
+  // embed69.org está bajo Cloudflare/bloqueado), prueba directamente el host
+  // del iframe como si fuera un extractor clásico (Vidhide/Streamwish/Filemoon).
+  if (!allStreams.length) {
+    for (var q = 0; q < players.length; q++) {
+      var url = String(players[q].url || "");
+      var host = "";
+      try { host = url.split("/")[2] || ""; } catch (e) {}
+      if (!host || triedHosts[host]) continue;
+      triedHosts[host] = true;
+      // Solo probamos hosts de reproductores conocidos
+      if (!/vidhide|morencius|streamwish|swhoi|hglink|strwish|filemoon|voe\.|dood|netu|hqq|rapidvideo|waaw/i.test(host)) {
+        continue;
+      }
+      try {
+        var direct = await extractStreamFromEmbed({
+          url: url,
+          server: serverLabel(url),
+          serverRaw: host,
+          lang: "Audio"
+        });
+        if (direct && direct.url) allStreams.push(direct);
+        if (allStreams.length >= 2) break;
+      } catch (e) {}
+    }
+  }
+
   if (!allStreams.length) {
     throw kino.error("unavailable", "extract failed", {
       userMessage:
-        "No se pudo obtener el video. Prueba otro servidor en el menú de fuentes.",
+        "No se pudo obtener el video. Prueba otro servidor en el menú de fuentes. " +
+        "Si el error persiste, el sitio puede estar bloqueado temporalmente por Cloudflare.",
     });
   }
 
